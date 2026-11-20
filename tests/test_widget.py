@@ -104,21 +104,12 @@ def test_cover_is_prescaled_once(widget) -> None:
     assert widget._cover_scaled is None and widget._background is None
 
 
-def test_paint_long_scrolling_title(widget) -> None:
-    """Прокручиваемый заголовок с дробным смещением рисуется без исключений."""
-    widget.set_track("A very very long title " * 4, "Artist", _cover())
-    widget._scroll_offset = 10.37
-    widget._fade = 255
-    image = widget.grab()
-    assert not image.isNull()
-
-
-def test_scroll_tick_advances_offset_for_long_title(widget) -> None:
+def test_long_title_is_elided_without_animations(widget) -> None:
+    """При «уменьшить движение» бегущей строки нет — заголовок обрезается."""
     widget.set_track("A very very long title " * 4, "Artist", None)
-    widget.show()
-    before = widget._scroll_offset
-    widget._on_scroll_tick()
-    assert widget._scroll_offset > before
+    assert widget._title_overflows() is False
+    assert not widget._marquee_pause.isActive()
+    assert not widget._marquee_frame.isActive()
 
 
 def test_restore_position_clamps_to_screen(widget, qapp) -> None:

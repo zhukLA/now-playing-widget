@@ -1,23 +1,35 @@
 """Окно виджета «Now Playing»: без рамки, прозрачное, со скруглением и тенью.
 
-Ключевые решения (по согласованному плану):
+Ключевые решения:
   * тень и скругление рисуются вручную в ``paintEvent`` (без QGraphicsEffect,
     чтобы не конфликтовать с эффектами и не размывать текст);
   * фон — размытая копия обложки (downscale + upscale со SmoothTransformation),
-    результат кэшируется и пересчитывается только при смене трека;
-  * обложка 90×90 рисуется поверх фона со скруглением через clip-path;
-  * заголовок прокручивается при переполнении, исполнитель обрезается elide;
-  * кнопки управления проявляются при наведении с fade-анимацией;
+    результат кэшируется и пересчитывается только при смене обложки;
+  * обложка 90×90 рисуется поверх фона со скруглением и мягкой тенью;
   * окно перетаскивается за любую область, позиция сохраняется в настройках.
+
+Анимации (в духе macOS, см. ``ui/anim.py``):
+  * окно плавно проявляется/гаснет (прозрачность окна);
+  * смена трека — перекрёстное затухание фона, обложки и текста, текст
+    слегка «въезжает» снизу;
+  * обложка чуть уменьшается на паузе и пружинит обратно при воспроизведении;
+  * длинный заголовок — бегущая строка: пауза в начале, плавная прокрутка
+    по времени (а не по тикам), растворение текста у краёв;
+  * кнопки: проявление при наведении, плавная подсветка, «нажатие» с
+    пружиной, морфинг значка play ↔ pause.
+Все анимации отключаются системной настройкой «Эффекты анимации» Windows
+или ``NOW_PLAYING_REDUCE_MOTION=1``.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+from dataclasses import dataclass
 from typing import Optional
 
 from PySide6.QtCore import (
-    QEasingCurve,
+    QElapsedTimer,
     QPoint,
     QPointF,
     QRect,
@@ -25,7 +37,6 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QTimer,
-    QVariantAnimation,
     Signal,
 )
 from PySide6.QtGui import (
@@ -46,10 +57,17 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QMenu, QWidget
 
 from settings import Settings
+from ui.anim import (
+    Tween,
+    ease_in_out_cubic,
+    ease_out_cubic,
+    spring,
+    system_animations_enabled,
+)
 
 logger = logging.getLogger("npw.ui")
 
-# Геометрия (согласовано: окно ~360×110 + поле под тень).
+# Геометрия (окно ~360×110 + поле под тень).
 SHADOW_MARGIN = 6
 WINDOW_SIZE = QSize(372, 122)  # карточка 360×110
 CARD_RADIUS = 14.0
@@ -61,9 +79,36 @@ TEXT_RIGHT_MARGIN = 14  # отступ текста от правого края
 BUTTON_SIZE = 26
 BUTTON_GAP = 8
 
-SCROLL_INTERVAL_MS = 35
-SCROLL_SPEED = 0.8  # px за тик
-SCROLL_GAP = 48  # отступ между концом и началом текста
+NO_MEDIA_TITLE = "Нет воспроизведения"
+NO_MEDIA_ARTIST = "Запустите музыку или видео"
+
+TITLE_COLOR = QColor(255, 255, 255, 245)
+ARTIST_COLOR = QColor(255, 255, 255, 165)
+
+# Тайминги анимаций, мс.
+WINDOW_FADE_IN_MS = 240
+WINDOW_FADE_OUT_MS = 200
+TRACK_XFADE_MS = 420
+TEXT_SLIDE_PX = 5.0
+BUTTONS_IN_MS = 200
+BUTTONS_OUT_MS = 280
+HOVER_IN_MS = 120
+HOVER_OUT_MS = 220
+PRESS_MS = 90
+RELEASE_MS = 480
+PLAY_MORPH_MS = 240
+COVER_SCALE_MS = 600
+COVER_SCALE_PAUSED = 0.94
+BUTTON_PRESS_SCALE = 0.12  # насколько «проседает» нажатая кнопка
+
+# Бегущая строка заголовка.
+MARQUEE_SPEED = 32.0  # px/с
+MARQUEE_PAUSE_MS = 2200  # пауза в начале каждого круга
+MARQUEE_GAP = 48  # отступ между концом и началом текста
+MARQUEE_FADE = 18  # ширина растворения текста у краёв, px
+MARQUEE_FRAME_MS = 16  # ~60 кадров/с
+
+BUTTON_NAMES = ("prev", "play_pause", "next")
 
 
 def _elide(text: str, font: QFont, width: int) -> str:
@@ -76,9 +121,28 @@ def blur_pixmap(src: QPixmap, size: QSize) -> QPixmap:
     if src.isNull() or size.width() <= 0 or size.height() <= 0:
         return QPixmap()
     small = src.scaled(
-        QSize(14, 14), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+        QSize(14, 14),
+        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        Qt.TransformationMode.SmoothTransformation,
     )
-    return small.scaled(size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    return small.scaled(
+        size, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation
+    )
+
+
+@dataclass(frozen=True)
+class _Frame:
+    """Снимок отображаемого содержимого — «старый» слой при переходе."""
+
+    title: str
+    artist: str
+    has_media: bool
+    cover: Optional[QPixmap]
+    background: Optional[QPixmap]
+
+    @property
+    def text_key(self) -> tuple[str, str, bool]:
+        return (self.title, self.artist, self.has_media)
 
 
 class NowPlayingWidget(QWidget):
@@ -89,15 +153,24 @@ class NowPlayingWidget(QWidget):
     quit_requested = Signal()
     position_changed = Signal(int, int)
 
-    def __init__(self, settings: Settings, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        parent: Optional[QWidget] = None,
+        *,
+        animations: Optional[bool] = None,
+    ) -> None:
         super().__init__(parent)
         self.settings = settings
+        self._animations = (
+            system_animations_enabled() if animations is None else bool(animations)
+        )
 
         self.setWindowTitle("Now Playing")
-        self.setWindowFlag(Qt.FramelessWindowHint, True)
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, settings.always_on_top)
-        self.setWindowFlag(Qt.Tool, True)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, settings.always_on_top)
+        self.setWindowFlag(Qt.WindowType.Tool, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
         self.resize(WINDOW_SIZE)
 
@@ -106,41 +179,69 @@ class NowPlayingWidget(QWidget):
         self._artist = ""
         self._has_media = False
         self._is_playing = False
+        self._cover_bytes: Optional[bytes] = None
         self._cover: Optional[QPixmap] = None
         # Обложка, уже отмасштабированная под COVER_SIZE (не пересчитывать
-        # SmoothTransformation на каждом кадре прокрутки).
+        # SmoothTransformation на каждом кадре анимации).
         self._cover_scaled: Optional[QPixmap] = None
         self._background: Optional[QPixmap] = None
 
-        # Fade кнопок
-        self._fade = 0
-        self._fade_anim = QVariantAnimation(self)
-        self._fade_anim.setDuration(160)
-        self._fade_anim.setEasingCurve(QEasingCurve.OutCubic)
-        self._fade_anim.valueChanged.connect(self._on_fade_changed)
+        # Видимость: логическая цель (окно может ещё догорать на fade-out).
+        self._target_visible = False
+        self._user_hidden = False
 
         # Состояние мыши/кнопок
+        self._mouse_inside = False
         self._hover_button: Optional[str] = None
+        self._pressed_button: Optional[str] = None
         self._dragging = False
         self._drag_offset = QPoint()
         self._drag_moved = False
         self._press_global = QPoint()
-        self._user_hidden = False
         self._button_handlers: dict = {}
 
-        # Прокрутка заголовка
-        self._scroll_offset = 0.0
-        self._scroll_timer = QTimer(self)
-        self._scroll_timer.setInterval(SCROLL_INTERVAL_MS)
-        self._scroll_timer.timeout.connect(self._on_scroll_tick)
+        # --- анимации ---
+        enabled = lambda: self._animations  # noqa: E731
+        repaint = lambda _v: self.update()  # noqa: E731
+        self._window_opacity = Tween(
+            1.0, self._on_window_opacity, enabled=enabled, parent=self
+        )
+        # Переход между треками: 0 → 1, старый слой — self._prev.
+        self._prev: Optional[_Frame] = None
+        self._xfade = Tween(1.0, repaint, enabled=enabled, parent=self)
+        self._buttons = Tween(0.0, repaint, enabled=enabled, parent=self)
+        self._hover = {n: Tween(0.0, repaint, enabled=enabled, parent=self) for n in BUTTON_NAMES}
+        self._press = {n: Tween(0.0, repaint, enabled=enabled, parent=self) for n in BUTTON_NAMES}
+        # 0 — значок play, 1 — pause.
+        self._play_morph = Tween(0.0, repaint, enabled=enabled, parent=self)
+        self._cover_scale = Tween(COVER_SCALE_PAUSED, repaint, enabled=enabled, parent=self)
+
+        # Бегущая строка: пауза → прокрутка по времени → пауза …
+        self._marquee_offset = 0.0
+        self._marquee_clock = QElapsedTimer()
+        self._marquee_frame = QTimer(self)
+        self._marquee_frame.setInterval(MARQUEE_FRAME_MS)
+        self._marquee_frame.setTimerType(Qt.TimerType.PreciseTimer)
+        self._marquee_frame.timeout.connect(self._marquee_tick)
+        self._marquee_pause = QTimer(self)
+        self._marquee_pause.setSingleShot(True)
+        self._marquee_pause.timeout.connect(self._marquee_resume)
 
         self._font_title = QFont("Segoe UI", 12, QFont.Weight.DemiBold)
         self._font_artist = QFont("Segoe UI", 9)
-        self._font_small = QFont("Segoe UI", 8)
 
     # ------------------------------------------------------------------
     # Публичный API (вызывается из main.py)
     # ------------------------------------------------------------------
+
+    @property
+    def animations_enabled(self) -> bool:
+        return self._animations
+
+    @property
+    def is_shown(self) -> bool:
+        """Логическая видимость (во время fade-out уже False)."""
+        return self._target_visible
 
     def set_settings(self, settings: Settings) -> None:
         """Применяет настройки (может пересоздать оконные флаги).
@@ -151,22 +252,14 @@ class NowPlayingWidget(QWidget):
         self.settings = settings
         on_top = bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
         if on_top != settings.always_on_top:
+            was_shown = self._target_visible
             self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, settings.always_on_top)
+            if was_shown and self._should_be_visible():
+                # Окно пересоздано — вернуть сразу, без повторного проявления.
+                self._window_opacity.set(1.0)
+                self.show()
         self._apply_visibility()
         self.update()
-
-    def _should_be_visible(self) -> bool:
-        if self._user_hidden:
-            return False
-        return self._has_media or not self.settings.hide_when_no_media
-
-    def _apply_visibility(self) -> None:
-        """Единое правило видимости: скрыт пользователем > нет медиа > показ."""
-        if self._should_be_visible():
-            if not self.isVisible():
-                self.show()
-        elif self.isVisible():
-            self.hide()
 
     def set_track(self, title: str, artist: str, cover_bytes: Optional[bytes]) -> None:
         """Новые данные трека. Обложка пересчитывается только при её наличии."""
@@ -177,17 +270,23 @@ class NowPlayingWidget(QWidget):
             f"{len(cover_bytes)}B" if cover_bytes else None,
             self._user_hidden,
         )
-        track_changed = title != self._title or artist != self._artist
+        track_changed = (
+            title != self._title or artist != self._artist or not self._has_media
+        )
+        cover_changed = bool(cover_bytes) and cover_bytes != self._cover_bytes
+        # Новый трек без обложки — старую не показываем (заглушка).
+        clear_cover = not cover_bytes and track_changed and self._cover_bytes is not None
+        if track_changed or cover_changed or clear_cover:
+            self._begin_transition()
         self._title = title
         self._artist = artist
         self._has_media = True
-        if track_changed:
-            self._scroll_offset = 0.0
-        if cover_bytes:
+        if cover_changed:
             self._apply_cover(cover_bytes)
-        elif track_changed:
-            # Новый трек без обложки — старую не показываем (заглушка).
+        elif clear_cover:
             self._apply_cover(None)
+        if track_changed:
+            self._restart_marquee()
         self._apply_visibility()
         self.update()
 
@@ -198,35 +297,21 @@ class NowPlayingWidget(QWidget):
             f"{len(cover_bytes)}B" if cover_bytes else None,
             self._user_hidden,
         )
+        if (cover_bytes or None) == self._cover_bytes:
+            return
+        self._begin_transition()
         self._apply_cover(cover_bytes)
         self.update()
-
-    def _clear_cover(self) -> None:
-        self._cover = None
-        self._cover_scaled = None
-        self._background = None
-
-    def _apply_cover(self, cover_bytes: Optional[bytes]) -> None:
-        """Загружает pixmap, масштабированную копию и размытый фон; None — заглушка."""
-        if not cover_bytes:
-            self._clear_cover()
-            return
-        pixmap = QPixmap()
-        if not pixmap.loadFromData(cover_bytes):
-            logger.warning("не удалось декодировать обложку (%dB)", len(cover_bytes))
-            self._clear_cover()
-            return
-        self._cover = pixmap
-        self._cover_scaled = pixmap.scaled(
-            QSize(COVER_SIZE, COVER_SIZE),
-            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self._background = blur_pixmap(pixmap, self.size())
 
     def set_playing(self, is_playing: bool) -> None:
         logger.debug("UI ← playback_state_changed: %s", is_playing)
         self._is_playing = bool(is_playing)
+        self._play_morph.to(
+            1.0 if self._is_playing else 0.0, PLAY_MORPH_MS, ease_in_out_cubic
+        )
+        self._cover_scale.to(
+            1.0 if self._is_playing else COVER_SCALE_PAUSED, COVER_SCALE_MS, spring
+        )
         self.update()
 
     def set_no_media(self) -> None:
@@ -236,12 +321,14 @@ class NowPlayingWidget(QWidget):
             self.settings.hide_when_no_media,
             self._user_hidden,
         )
+        if self._has_media or self._cover_bytes is not None:
+            self._begin_transition()
         self._has_media = False
         self._title = ""
         self._artist = ""
-        self._clear_cover()
-        self._is_playing = False
-        self._scroll_offset = 0.0
+        self._apply_cover(None)
+        self.set_playing(False)
+        self._restart_marquee()
         self._apply_visibility()
         self.update()
 
@@ -282,6 +369,100 @@ class NowPlayingWidget(QWidget):
     def save_position(self) -> None:
         self.position_changed.emit(self.x(), self.y())
 
+    def set_button_handlers(self, handlers: dict) -> None:
+        """Ставит коллбэки {name: callable} для кнопок prev/play_pause/next."""
+        self._button_handlers = dict(handlers)
+
+    # ------------------------------------------------------------------
+    # Видимость окна (с плавным проявлением/угасанием)
+    # ------------------------------------------------------------------
+
+    def _should_be_visible(self) -> bool:
+        if self._user_hidden:
+            return False
+        return self._has_media or not self.settings.hide_when_no_media
+
+    def _apply_visibility(self) -> None:
+        """Единое правило видимости: скрыт пользователем > нет медиа > показ."""
+        if self._should_be_visible():
+            self._fade_window_in()
+        else:
+            self._fade_window_out()
+
+    def _fade_window_in(self) -> None:
+        self._target_visible = True
+        if not self.isVisible():
+            self._window_opacity.set(0.0)
+            self.show()
+        self._window_opacity.to(1.0, WINDOW_FADE_IN_MS, ease_out_cubic)
+
+    def _fade_window_out(self) -> None:
+        self._target_visible = False
+        if not self.isVisible():
+            return
+        self._window_opacity.to(
+            0.0, WINDOW_FADE_OUT_MS, ease_in_out_cubic, on_done=self._finish_hide
+        )
+
+    def _finish_hide(self) -> None:
+        if not self._target_visible:
+            self.hide()
+
+    def _on_window_opacity(self, value: float) -> None:
+        self.setWindowOpacity(max(0.0, min(1.0, value)))
+
+    # ------------------------------------------------------------------
+    # Обложка и переход между треками
+    # ------------------------------------------------------------------
+
+    def _snapshot(self) -> _Frame:
+        return _Frame(
+            title=self._title,
+            artist=self._artist,
+            has_media=self._has_media,
+            cover=self._cover_scaled,
+            background=self._background,
+        )
+
+    def _begin_transition(self) -> None:
+        """Запомнить текущее содержимое как «старый» слой и начать переход."""
+        if not (self._animations and self.isVisible()):
+            self._prev = None
+            self._xfade.set(1.0)
+            return
+        self._prev = self._snapshot()
+        self._xfade.set(0.0)
+        self._xfade.to(1.0, TRACK_XFADE_MS, ease_in_out_cubic, on_done=self._end_transition)
+
+    def _end_transition(self) -> None:
+        self._prev = None
+        self.update()
+
+    def _clear_cover(self) -> None:
+        self._cover_bytes = None
+        self._cover = None
+        self._cover_scaled = None
+        self._background = None
+
+    def _apply_cover(self, cover_bytes: Optional[bytes]) -> None:
+        """Загружает pixmap, масштабированную копию и размытый фон; None — заглушка."""
+        if not cover_bytes:
+            self._clear_cover()
+            return
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(cover_bytes):
+            logger.warning("не удалось декодировать обложку (%dB)", len(cover_bytes))
+            self._clear_cover()
+            return
+        self._cover_bytes = cover_bytes
+        self._cover = pixmap
+        self._cover_scaled = pixmap.scaled(
+            QSize(COVER_SIZE, COVER_SIZE),
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._background = blur_pixmap(pixmap, self.size())
+
     # ------------------------------------------------------------------
     # Геометрия
     # ------------------------------------------------------------------
@@ -315,6 +496,16 @@ class NowPlayingWidget(QWidget):
             card.height() - 28,
         )
 
+    def _title_baseline(self) -> int:
+        return self._text_rect().top() + QFontMetrics(self._font_title).ascent() + 6
+
+    def _title_rect(self) -> QRect:
+        """Полоса заголовка — её перерисовывает бегущая строка."""
+        area = self._text_rect()
+        return QRect(
+            area.left(), area.top(), area.width(), QFontMetrics(self._font_title).height() + 10
+        )
+
     def _button_rects(self) -> dict[str, QRect]:
         card = self._card_rect()
         right = card.right() - 10
@@ -324,6 +515,12 @@ class NowPlayingWidget(QWidget):
             x = right - i * (BUTTON_SIZE + BUTTON_GAP) - BUTTON_SIZE
             rects[name] = QRect(x, bottom, BUTTON_SIZE, BUTTON_SIZE)
         return rects
+
+    def _button_at(self, pos: QPoint) -> Optional[str]:
+        for name, rect in self._button_rects().items():
+            if rect.contains(pos):
+                return name
+        return None
 
     def _center_bottom_right(self) -> None:
         screen = QGuiApplication.primaryScreen()
@@ -347,236 +544,374 @@ class NowPlayingWidget(QWidget):
 
     def _paint(self, painter: QPainter) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
 
         card = self._card_rect()
         radius = CARD_RADIUS
+        prev = self._prev
+        t = self._xfade.value if prev is not None else 1.0
 
         # --- тень (рисуется вручную, слоями) ---
         steps = SHADOW_MARGIN
+        painter.setPen(Qt.PenStyle.NoPen)
         for i in range(steps, 0, -1):
             alpha = int(90 * ((steps - i + 1) / steps) ** 2)
-            painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(0, 0, 0, alpha))
             painter.drawRoundedRect(card.adjusted(-i, -i, i, i), radius + i, radius + i)
 
-        # --- фон карточки (размытая обложка + затемнение) ---
         painter.save()
         try:
             path = QPainterPath()
-            path.addRoundedRect(card, radius, radius)
+            path.addRoundedRect(QRectF(card), radius, radius)
             painter.setClipPath(path)
 
-            if self._background is not None and not self._background.isNull():
-                painter.drawPixmap(card.topLeft(), self._background)
-                painter.fillRect(card, QColor(0, 0, 0, 140))
+            # --- фон: старый слой целиком, новый проявляется поверх ---
+            if prev is not None and prev.background is not self._background:
+                self._draw_background(painter, card, prev.background, 1.0)
+                self._draw_background(painter, card, self._background, t)
             else:
-                gradient = QLinearGradient(card.topLeft(), card.bottomRight())
-                gradient.setColorAt(0.0, QColor(32, 36, 44))
-                gradient.setColorAt(1.0, QColor(18, 20, 25))
-                painter.fillRect(card, gradient)
+                self._draw_background(painter, card, self._background, 1.0)
 
             # лёгкая рамка
             painter.setPen(QPen(QColor(255, 255, 255, 26), 1))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(card, radius, radius)
 
-            # --- обложка ---
-            self._draw_cover(painter)
-
-            # --- текст ---
-            self._draw_texts(painter)
-
-            # --- кнопки ---
+            self._draw_cover(painter, prev, t)
+            self._draw_texts(painter, prev, t)
             self._draw_buttons(painter)
         finally:
             painter.restore()
 
-    def _draw_cover(self, painter: QPainter) -> None:
-        rect = self._cover_rect()
+    def _draw_background(
+        self, painter: QPainter, card: QRect, background: Optional[QPixmap], opacity: float
+    ) -> None:
+        if opacity <= 0.0:
+            return
         painter.save()
+        painter.setOpacity(opacity)
+        if background is not None and not background.isNull():
+            painter.drawPixmap(card.topLeft(), background)
+            painter.fillRect(card, QColor(0, 0, 0, 140))
+        else:
+            gradient = QLinearGradient(QPointF(card.topLeft()), QPointF(card.bottomRight()))
+            gradient.setColorAt(0.0, QColor(32, 36, 44))
+            gradient.setColorAt(1.0, QColor(18, 20, 25))
+            painter.fillRect(card, gradient)
+        painter.restore()
+
+    # -- обложка -------------------------------------------------------------
+
+    def _draw_cover(self, painter: QPainter, prev: Optional[_Frame], t: float) -> None:
+        rect = QRectF(self._cover_rect())
+        scale = self._cover_scale.value
+        painter.save()
+        center = rect.center()
+        painter.translate(center)
+        painter.scale(scale, scale)
+        painter.translate(-center)
+
+        # Мягкая тень под обложкой — «приподнята» над фоном, как в macOS.
+        painter.setPen(Qt.PenStyle.NoPen)
+        for i in range(4, 0, -1):
+            painter.setBrush(QColor(0, 0, 0, 14 + (4 - i) * 6))
+            painter.drawRoundedRect(
+                rect.adjusted(-i, -i + 2, i, i + 2), COVER_RADIUS + i, COVER_RADIUS + i
+            )
+
         path = QPainterPath()
         path.addRoundedRect(rect, COVER_RADIUS, COVER_RADIUS)
-        painter.setClipPath(path)
-        scaled = self._cover_scaled
-        if scaled is not None and not scaled.isNull():
-            x = rect.left() + (rect.width() - scaled.width()) // 2
-            y = rect.top() + (rect.height() - scaled.height()) // 2
-            painter.drawPixmap(QPoint(x, y), scaled)
+        painter.setClipPath(path, Qt.ClipOperation.IntersectClip)
+        if prev is not None and prev.cover is not self._cover_scaled:
+            self._draw_cover_layer(painter, rect, prev.cover, 1.0)
+            self._draw_cover_layer(painter, rect, self._cover_scaled, t)
+        else:
+            self._draw_cover_layer(painter, rect, self._cover_scaled, 1.0)
+        painter.restore()
+
+    def _draw_cover_layer(
+        self, painter: QPainter, rect: QRectF, cover: Optional[QPixmap], opacity: float
+    ) -> None:
+        if opacity <= 0.0:
+            return
+        painter.save()
+        painter.setOpacity(opacity)
+        if cover is not None and not cover.isNull():
+            x = rect.left() + (rect.width() - cover.width()) / 2
+            y = rect.top() + (rect.height() - cover.height()) / 2
+            painter.drawPixmap(QPointF(x, y), cover)
         else:
             gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
             gradient.setColorAt(0.0, QColor(48, 54, 66))
             gradient.setColorAt(1.0, QColor(30, 34, 42))
             painter.fillRect(rect, gradient)
-            # нотка-заглушка
             painter.setPen(QColor(255, 255, 255, 120))
             painter.setFont(QFont("Segoe UI", 26))
-            painter.drawText(
-                rect, Qt.AlignmentFlag.AlignCenter, "\u266a"
-            )
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "♪")
         painter.restore()
 
-    def _draw_texts(self, painter: QPainter) -> None:
+    # -- текст ---------------------------------------------------------------
+
+    def _draw_texts(self, painter: QPainter, prev: Optional[_Frame], t: float) -> None:
+        current = (self._title, self._artist, self._has_media)
+        if prev is not None and prev.text_key != current:
+            # Старый текст уходит вверх и гаснет, новый въезжает снизу.
+            self._draw_text_block(
+                painter, *prev.text_key, opacity=1.0 - t, dy=-TEXT_SLIDE_PX * t, marquee=False
+            )
+            self._draw_text_block(
+                painter, *current, opacity=t, dy=TEXT_SLIDE_PX * (1.0 - t), marquee=True
+            )
+        else:
+            self._draw_text_block(painter, *current, opacity=1.0, dy=0.0, marquee=True)
+
+    def _draw_text_block(
+        self,
+        painter: QPainter,
+        title: str,
+        artist: str,
+        has_media: bool,
+        *,
+        opacity: float,
+        dy: float,
+        marquee: bool,
+    ) -> None:
+        if opacity <= 0.0:
+            return
         area = self._text_rect()
         metrics_title = QFontMetrics(self._font_title)
         metrics_artist = QFontMetrics(self._font_artist)
+        if not has_media:
+            title, artist = NO_MEDIA_TITLE, NO_MEDIA_ARTIST
 
-        title = self._title if self._has_media else "Нет воспроизведения"
-        artist = (
-            self._artist
-            if self._has_media
-            else "Запустите музыку или видео"
-        )
+        painter.save()
+        painter.setOpacity(opacity)
+        painter.translate(0.0, dy)
 
-        painter.setFont(self._font_title)
-        painter.setPen(QColor(255, 255, 255, 245))
-        title_y = area.top() + metrics_title.ascent() + 6
-
-        title_width = metrics_title.horizontalAdvance(title)
-        if title and title_width > area.width() and self._has_media:
-            # Прокрутка: рисуем два раза со сдвигом. QPointF — субпиксельный
-            # сдвиг (QPoint отбрасывал дробную часть и текст «дёргался»).
-            painter.save()
-            painter.setClipRect(area)
-            x = area.left() - self._scroll_offset
-            painter.drawText(QPointF(x, title_y), title)
-            painter.drawText(QPointF(x + title_width + SCROLL_GAP, title_y), title)
-            painter.restore()
+        if marquee and self._title_overflows(title, has_media):
+            self._draw_marquee(painter, title)
         else:
+            painter.setFont(self._font_title)
+            painter.setPen(TITLE_COLOR)
             painter.drawText(
-                QPoint(area.left(), title_y),
+                QPointF(area.left(), self._title_baseline()),
                 _elide(title, self._font_title, area.width()),
             )
 
         painter.setFont(self._font_artist)
-        painter.setPen(QColor(255, 255, 255, 165))
+        painter.setPen(ARTIST_COLOR)
         artist_y = area.top() + metrics_title.height() + metrics_artist.ascent() + 8
         painter.drawText(
-            QPoint(area.left(), artist_y),
+            QPointF(area.left(), artist_y),
             _elide(artist, self._font_artist, area.width()),
         )
+        painter.restore()
+
+    def _title_overflows(self, title: Optional[str] = None, has_media: Optional[bool] = None) -> bool:
+        """Нужна ли бегущая строка (при выключенных анимациях — elide)."""
+        title = self._title if title is None else title
+        has_media = self._has_media if has_media is None else has_media
+        if not (self._animations and has_media and title):
+            return False
+        width = QFontMetrics(self._font_title).horizontalAdvance(title)
+        return width > self._text_rect().width()
+
+    def _draw_marquee(self, painter: QPainter, title: str) -> None:
+        """Заголовок со сдвигом и растворением у краёв (маска через слой)."""
+        rect = self._title_rect()
+        dpr = max(1.0, self.devicePixelRatioF())
+        layer = QPixmap(
+            QSize(math.ceil(rect.width() * dpr), math.ceil(rect.height() * dpr))
+        )
+        layer.setDevicePixelRatio(dpr)
+        layer.fill(Qt.GlobalColor.transparent)
+
+        width = QFontMetrics(self._font_title).horizontalAdvance(title)
+        period = width + MARQUEE_GAP
+        offset = self._marquee_offset
+        baseline = self._title_baseline() - rect.top()
+
+        p = QPainter(layer)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+            p.setFont(self._font_title)
+            p.setPen(TITLE_COLOR)
+            p.drawText(QPointF(-offset, baseline), title)
+            p.drawText(QPointF(-offset + period, baseline), title)
+
+            # Левый край растворяется, только пока у края нет начала строки —
+            # иначе первая буква «мигала» бы при каждом новом круге.
+            near_start = min(offset, period - offset)
+            left_alpha = int(255 * (1.0 - min(1.0, near_start / MARQUEE_FADE)))
+            w = float(rect.width())
+            f = min(0.45, MARQUEE_FADE / w)
+            mask = QLinearGradient(0.0, 0.0, w, 0.0)
+            mask.setColorAt(0.0, QColor(0, 0, 0, left_alpha))
+            mask.setColorAt(f, QColor(0, 0, 0, 255))
+            mask.setColorAt(1.0 - f, QColor(0, 0, 0, 255))
+            mask.setColorAt(1.0, QColor(0, 0, 0, 0))
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+            p.fillRect(QRectF(0.0, 0.0, w, float(rect.height())), mask)
+        finally:
+            p.end()
+        painter.drawPixmap(rect.topLeft(), layer)
+
+    # -- кнопки --------------------------------------------------------------
 
     def _draw_buttons(self, painter: QPainter) -> None:
-        if self._fade <= 0:
+        alpha = self._buttons.value
+        if alpha <= 0.001:
             return
-        alpha = self._fade
-        rects = self._button_rects()
-        for name, rect in rects.items():
-            hovered = self._hover_button == name
-            base = QColor(255, 255, 255, int(38 * alpha / 255))
-            if hovered:
-                base = QColor(255, 255, 255, int(85 * alpha / 255))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(base)
-            painter.drawRoundedRect(rect, rect.width() // 2, rect.height() // 2)
-
-            color = QColor(255, 255, 255, int(235 * alpha / 255))
-            if not self._has_media:
-                color = QColor(255, 255, 255, int(90 * alpha / 255))
-            self._draw_button_icon(painter, name, rect, color)
-
-    def _draw_button_icon(
-        self, painter: QPainter, name: str, rect: QRect, color: QColor
-    ) -> None:
         painter.save()
-        painter.setPen(QPen(color, 1.6))
-        painter.setBrush(color)
-        cx = rect.center().x()
-        cy = rect.center().y()
-        s = 6.5
-        if name == "play_pause":
-            if self._is_playing:
-                w = 3.4
-                painter.drawRect(QRectF(cx - 5.0, cy - s, w, 2 * s))
-                painter.drawRect(QRectF(cx + 1.6, cy - s, w, 2 * s))
+        # Кнопки слегка всплывают при проявлении.
+        painter.translate(0.0, 3.0 * (1.0 - alpha))
+        for name, rect in self._button_rects().items():
+            hover = self._hover[name].value
+            press = self._press[name].value
+            scale = 1.0 - BUTTON_PRESS_SCALE * press
+            center = QRectF(rect).center()
+
+            painter.save()
+            painter.translate(center)
+            painter.scale(scale, scale)
+            painter.translate(-center)
+
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, int((30 + 55 * hover) * alpha)))
+            painter.drawEllipse(QRectF(rect))
+
+            icon_alpha = (235 if self._has_media else 90) * alpha
+            if name == "play_pause":
+                m = self._play_morph.value
+                self._draw_glyph(painter, "play", center, icon_alpha * (1.0 - m), 0.55 + 0.45 * (1.0 - m))
+                self._draw_glyph(painter, "pause", center, icon_alpha * m, 0.55 + 0.45 * m)
             else:
-                path = QPainterPath()
-                path.moveTo(cx - 4.5, cy - s)
-                path.lineTo(cx + 5.5, cy)
-                path.lineTo(cx - 4.5, cy + s)
-                path.closeSubpath()
-                painter.drawPath(path)
-        elif name == "next":
+                self._draw_glyph(painter, name, center, icon_alpha, 1.0)
+            painter.restore()
+        painter.restore()
+
+    def _draw_glyph(
+        self, painter: QPainter, glyph: str, center: QPointF, alpha: float, scale: float
+    ) -> None:
+        if alpha <= 0.5:
+            return
+        color = QColor(255, 255, 255, int(min(255.0, alpha)))
+        painter.save()
+        painter.translate(center)
+        painter.scale(scale, scale)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        s = 6.5
+        if glyph == "pause":
+            painter.drawRoundedRect(QRectF(-5.0, -s, 3.4, 2 * s), 1.0, 1.0)
+            painter.drawRoundedRect(QRectF(1.6, -s, 3.4, 2 * s), 1.0, 1.0)
+        elif glyph == "play":
             path = QPainterPath()
-            path.moveTo(cx - 5.5, cy - s)
-            path.lineTo(cx + 2.5, cy)
-            path.lineTo(cx - 5.5, cy + s)
+            path.moveTo(-4.5, -s)
+            path.lineTo(5.5, 0.0)
+            path.lineTo(-4.5, s)
             path.closeSubpath()
             painter.drawPath(path)
-            painter.drawRect(QRectF(cx + 3.6, cy - s, 2.4, 2 * s))
+        elif glyph == "next":
+            path = QPainterPath()
+            path.moveTo(-5.5, -s)
+            path.lineTo(2.5, 0.0)
+            path.lineTo(-5.5, s)
+            path.closeSubpath()
+            painter.drawPath(path)
+            painter.drawRoundedRect(QRectF(3.6, -s, 2.4, 2 * s), 0.8, 0.8)
         else:  # prev
             path = QPainterPath()
-            path.moveTo(cx + 5.5, cy - s)
-            path.lineTo(cx - 2.5, cy)
-            path.lineTo(cx + 5.5, cy + s)
+            path.moveTo(5.5, -s)
+            path.lineTo(-2.5, 0.0)
+            path.lineTo(5.5, s)
             path.closeSubpath()
             painter.drawPath(path)
-            painter.drawRect(QRectF(cx - 6.0, cy - s, 2.4, 2 * s))
+            painter.drawRoundedRect(QRectF(-6.0, -s, 2.4, 2 * s), 0.8, 0.8)
         painter.restore()
 
     # ------------------------------------------------------------------
-    # Анимации/таймеры
+    # Бегущая строка
     # ------------------------------------------------------------------
 
-    def _on_fade_changed(self, value) -> None:
-        self._fade = int(value)
-        self.update()
+    def _restart_marquee(self) -> None:
+        """С начала: строка стоит MARQUEE_PAUSE_MS, затем поехали."""
+        self._marquee_frame.stop()
+        self._marquee_pause.stop()
+        self._marquee_offset = 0.0
+        if self.isVisible() and self._title_overflows():
+            self._marquee_pause.start(MARQUEE_PAUSE_MS)
 
-    def _start_fade(self, target: int) -> None:
-        self._fade_anim.stop()
-        self._fade_anim.setStartValue(self._fade)
-        self._fade_anim.setEndValue(target)
-        self._fade_anim.start()
+    def _marquee_resume(self) -> None:
+        if not (self.isVisible() and self._title_overflows()):
+            return
+        self._marquee_clock.start()
+        self._marquee_frame.start()
 
-    def _on_scroll_tick(self) -> None:
-        if not self.isVisible() or not self._has_media:
+    def _marquee_tick(self) -> None:
+        if not (self.isVisible() and self._title_overflows()):
+            self._marquee_frame.stop()
+            self._marquee_offset = 0.0
+            self.update(self._title_rect())
             return
-        area = self._text_rect()
-        metrics = QFontMetrics(self._font_title)
-        width = metrics.horizontalAdvance(self._title)
-        if width <= area.width():
-            if self._scroll_offset:
-                self._scroll_offset = 0.0
-                self.update(area)
-            return
-        self._scroll_offset += SCROLL_SPEED
-        if self._scroll_offset > width + SCROLL_GAP:
-            self._scroll_offset = 0.0
-        # Перерисовываем только область текста, а не всю карточку с тенью.
-        self.update(area)
+        # Сдвиг по реальному времени: скорость не зависит от частоты таймера
+        # и «подлагиваний» цикла событий (кламп — без скачка после зависания).
+        dt = min(0.1, self._marquee_clock.restart() / 1000.0)
+        self._marquee_offset += MARQUEE_SPEED * dt
+        period = QFontMetrics(self._font_title).horizontalAdvance(self._title) + MARQUEE_GAP
+        if self._marquee_offset >= period:
+            # Вторая копия ровно на месте первой — сброс незаметен.
+            self._marquee_offset = 0.0
+            self._marquee_frame.stop()
+            self._marquee_pause.start(MARQUEE_PAUSE_MS)
+        # Перерисовываем только полосу заголовка, а не всю карточку с тенью.
+        self.update(self._title_rect())
 
     # ------------------------------------------------------------------
     # Мышь: hover, кнопки, перетаскивание
     # ------------------------------------------------------------------
 
     def enterEvent(self, event) -> None:  # noqa: N802
-        self._start_fade(255)
+        self._mouse_inside = True
+        self._buttons.to(1.0, BUTTONS_IN_MS, ease_out_cubic)
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:  # noqa: N802
-        self._hover_button = None
-        self._start_fade(0)
+        self._mouse_inside = False
+        self._set_hover(None)
+        self._buttons.to(0.0, BUTTONS_OUT_MS, ease_in_out_cubic)
         super().leaveEvent(event)
+
+    def _set_hover(self, name: Optional[str]) -> None:
+        if name == self._hover_button:
+            return
+        if self._hover_button is not None:
+            self._hover[self._hover_button].to(0.0, HOVER_OUT_MS, ease_in_out_cubic)
+        if name is not None:
+            self._hover[name].to(1.0, HOVER_IN_MS, ease_out_cubic)
+        self._hover_button = name
+
+    def _release_press(self) -> None:
+        if self._pressed_button is not None:
+            self._press[self._pressed_button].to(0.0, RELEASE_MS, spring)
+            self._pressed_button = None
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._dragging:
             delta = event.globalPosition().toPoint() - self._press_global
             if not self._drag_moved and manhattan(delta) > 3:
                 self._drag_moved = True
+                self._release_press()  # начали тащить — это не нажатие кнопки
+                self._set_hover(None)
             if self._drag_moved:
                 self.move(self._drag_offset + delta)
             event.accept()
             return
 
         pos = event.position().toPoint()
-        hovered = None
-        if self._fade > 0:
-            for name, rect in self._button_rects().items():
-                if rect.contains(pos):
-                    hovered = name
-                    break
-        if hovered != self._hover_button:
-            self._hover_button = hovered
-            self.update()
+        self._set_hover(self._button_at(pos) if self._mouse_inside else None)
         super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
@@ -585,6 +920,10 @@ class NowPlayingWidget(QWidget):
             self._drag_moved = False
             self._press_global = event.globalPosition().toPoint()
             self._drag_offset = self.pos()
+            name = self._button_at(event.position().toPoint())
+            if name is not None and self._has_media:
+                self._pressed_button = name
+                self._press[name].to(1.0, PRESS_MS, ease_out_cubic)
             event.accept()
             return
         super().mousePressEvent(event)
@@ -592,16 +931,12 @@ class NowPlayingWidget(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton and self._dragging:
             self._dragging = False
+            pressed = self._pressed_button
+            self._release_press()
             if self._drag_moved:
                 self.save_position()
-            else:
-                # Клик без движения: возможно, по кнопке.
-                pos = event.position().toPoint()
-                if self._has_media:
-                    for name, rect in self._button_rects().items():
-                        if rect.contains(pos):
-                            self._on_button_clicked(name)
-                            break
+            elif pressed is not None and self._button_at(event.position().toPoint()) == pressed:
+                self._on_button_clicked(pressed)
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -611,10 +946,6 @@ class NowPlayingWidget(QWidget):
         handler = self._button_handlers.get(name)
         if handler is not None:
             handler()
-
-    def set_button_handlers(self, handlers: dict) -> None:
-        """Ставит коллбэки {name: callable} для кнопок prev/play_pause/next."""
-        self._button_handlers = dict(handlers)
 
     # ------------------------------------------------------------------
     # Контекстное меню
@@ -653,15 +984,17 @@ class NowPlayingWidget(QWidget):
         super().resizeEvent(event)
         if self._cover is not None and not self._cover.isNull():
             self._background = blur_pixmap(self._cover, self.size())
-        self._scroll_timer.start()  # пересчитает необходимость прокрутки
+        self._restart_marquee()
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
-        self._scroll_timer.start()
+        self._restart_marquee()
 
     def hideEvent(self, event) -> None:  # noqa: N802
         super().hideEvent(event)
-        self._scroll_timer.stop()
+        self._marquee_frame.stop()
+        self._marquee_pause.stop()
+        self._marquee_offset = 0.0
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         # Крестика у безрамочного окна нет, но Alt+F4 работает. Считаем это
@@ -669,6 +1002,7 @@ class NowPlayingWidget(QWidget):
         # треке. Вернуть — из трея или повторным запуском приложения.
         self.save_position()
         self._user_hidden = True
+        self._target_visible = False
         super().closeEvent(event)
 
 

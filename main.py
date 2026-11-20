@@ -136,7 +136,9 @@ class Application(QObject):
             self._toggle_visibility()
 
     def _toggle_visibility(self) -> None:
-        if self.widget.isVisible():
+        # is_shown — логическая видимость: во время плавного угасания окно
+        # ещё isVisible(), но повторный клик должен вернуть его, а не «скрыть».
+        if self.widget.is_shown:
             self.widget.set_user_hidden(True)
         else:
             self.show_widget()
@@ -145,7 +147,7 @@ class Application(QObject):
         """Показать и поднять окно (трей, повторный запуск приложения)."""
         self.widget.set_user_hidden(False)
         # При «прятать без медиа» окна может не быть — поднимать нечего.
-        if self.widget.isVisible():
+        if self.widget.is_shown:
             self.widget.raise_()
             self.widget.activateWindow()
 
