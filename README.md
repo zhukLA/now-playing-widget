@@ -26,12 +26,12 @@
 
 ## Установка и запуск (из исходников)
 
-Все команды запускаются из корня проекта. Путь содержит пробелы — заключайте
-его в кавычки:
+Все команды запускаются из корня проекта. Если путь содержит пробелы —
+заключайте его в кавычки:
 
 ```bat
-cd "C:\Users\PC\Documents\Project OpenCode"
-cd NowPlayingWidget
+git clone https://github.com/zhukLA/now-playing-widget.git
+cd now-playing-widget
 
 python -m venv .venv
 .venv\Scripts\activate
@@ -69,15 +69,31 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
+Тесты не требуют Windows API и дисплея: winrt замокан, Qt-виджеты
+рендерятся в `offscreen` (см. `tests/conftest.py`). Они же гоняются в
+GitHub Actions на каждый push (`.github/workflows/tests.yml`).
+
+### Логи и отладка
+
+- Лог: `%APPDATA%\NowPlayingWidget\app.log` (ротация 1 МБ × 3). Туда же
+  попадают необработанные исключения — в собранном `exe` консоли нет.
+- `NOW_PLAYING_DEBUG=1` — подробный DEBUG-лог и копия последней обложки
+  в `%APPDATA%\NowPlayingWidget\debug_cover.bin`.
+- В dev-режиме приложение закрывается по `Ctrl+C` в консоли.
+
 ---
 
 ## Управление
 
-- **Перетаскивание** — за любую область окна; позиция запоминается.
+- **Перетаскивание** — за любую область окна; позиция запоминается
+  (с учётом нескольких мониторов; если монитор отключён — окно переносится
+  на основной).
 - **ПКМ** — контекстное меню: «Поверх всех окон» (галочка), «Автозапуск»
   (галочка), «Настройки», «Закрыть».
 - **Наведение мыши** — проявляются кнопки prev / play-pause / next (fade).
 - **Трей** — левый клик: показать/скрыть; ПКМ: «Показать/Скрыть», «Выход».
+- **Alt+F4** — скрывает виджет (как «Скрыть» в трее); приложение продолжает
+  работать, вернуть окно можно из трея или повторным запуском.
 - Если медиа нет: виджет либо скрывается (настройка «Прятать виджет, когда нет
   медиа»), либо показывает заглушку.
 - Повторный запуск приложения не создаёт вторую копию — уже запущенное окно
@@ -101,8 +117,7 @@ pytest
 Сборка выполняется в окружении проекта с dev-зависимостями:
 
 ```bat
-cd "C:\Users\PC\Documents\Project OpenCode"
-cd NowPlayingWidget
+cd now-playing-widget
 .venv\Scripts\activate
 pip install -r requirements-dev.txt
 ```
@@ -145,6 +160,8 @@ iscc installer.iss
 
 - В **frozen-сборке** (`exe`): включается в настройках виджета или при установке
   (галочка «Запускать вместе с Windows»). В реестр пишется путь к `sys.executable`.
+  Источник правды — реестр: при старте флаг в настройках синхронизируется с ним,
+  поэтому галочка в меню совпадает с выбором в установщике.
 - В **dev-режиме** (`python main.py`) автозапуск намеренно **не регистрируется**
   в реестре — значение `Run` с командой `python main.py` не создаётся. Флаг в
   настройках хранится, но в реестр не пишется.
@@ -170,16 +187,18 @@ iscc installer.iss
 ## Структура проекта
 
 ```
-NowPlayingWidget/
+now-playing-widget/
 ├── main.py                 # точка входа: single-instance, трей, связка UI и контроллера
 ├── media_controller.py     # SMTC + asyncio-цикл в QThread + MOCK-режим
 ├── settings.py             # JSON-настройки в %APPDATA%\NowPlayingWidget\ (+ автозапуск)
+├── app_log.py              # лог-файл с ротацией + перехват необработанных исключений
 ├── ui/
 │   ├── widget.py           # окно виджета (paintEvent: тень, скругления, кнопки)
 │   └── settings_dialog.py  # диалог настроек
 ├── assets/icon.ico         # иконка (генерируется tools/generate_icon.py)
 ├── tools/generate_icon.py  # разовый скрипт генерации иконки (PySide6)
-├── tests/                  # pytest: settings + MOCK-парсинг
+├── tests/                  # pytest: настройки, SMTC-обвязка, гонки, виджет, single-instance
+├── .github/workflows/      # CI: pytest на Windows
 ├── requirements.txt        # runtime-зависимости
 ├── requirements-dev.txt    # + pytest, pyinstaller
 ├── build.spec              # PyInstaller (onedir, windowed)

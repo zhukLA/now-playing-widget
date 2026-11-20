@@ -794,7 +794,11 @@ class MediaController(QObject):
         if new_track:
             self._cancel_cover_retry()
             prev_sha = self._last_cover_sha1
-            cover = await self._read_cover_if(props, enabled=with_cover)
+            # Обложку нового трека читаем ВСЕГДА, даже если refresh пришёл от
+            # playback_info_changed (with_cover=False): иначе трек уходил в UI
+            # без обложки, повторы не запускались, и заглушка оставалась
+            # до следующего media_properties_changed (которого может не быть).
+            cover = await self._read_cover_if(props, enabled=True)
             if not self._refresh_is_current(seq, session):
                 return
             # Обложка прошлого трека НЕ должна остаться: если её нет —
@@ -815,7 +819,7 @@ class MediaController(QObject):
                 and prev_sha is not None
                 and _sha1(cover) == prev_sha
             )
-            if with_cover and (cover is None or same_as_prev):
+            if cover is None or same_as_prev:
                 reason = (
                     "обложка отсутствует"
                     if cover is None
@@ -878,7 +882,12 @@ class MediaController(QObject):
             except Exception:
                 logger.warning("get_current_session при проверке сессии", exc_info=True)
                 current = None
-        if current is not None and current is not self._session:
+        # ВАЖНО: winrt на каждый get_current_session() отдаёт НОВУЮ
+        # Python-обёртку, поэтому проверки ``is`` недостаточно. Если менеджер
+        # вернул ту же сессию (тот же AUMID), что только что не прочиталась,
+        # переподписка на неё дала бы бесконечный цикл
+        # refresh → ошибка → _set_session → refresh … каждые REFRESH_DEBOUNCE.
+        if current is not None and not _same_session(current, self._session):
             logger.info("сессия сменилась: %s → %s", _auid(self._session), _auid(current))
             self._set_session(current)
             return
@@ -1115,7 +1124,7 @@ class MediaController(QObject):
         """Однократная отписка от событий менеджера по сохранённому токену."""
         manager, self._manager = self._manager, None
         token, self._current_token = self._current_token, None
-        handler, self._current_handler = self._current_handler, None
+        self._current_handler = None
         if manager is None or token is None:
             return
         try:
@@ -1134,3 +1143,13 @@ def _auid(session: Any) -> Optional[str]:
     except Exception:
         logger.debug("source_app_user_model_id недоступен", exc_info=True)
         return None
+
+
+def _same_session(a: Any, b: Any) -> bool:
+    """Одна и та же SMTC-сессия: тот же объект или тот же непустой AUMID."""
+    if a is b:
+        return True
+    if a is None or b is None:
+        return False
+    aumid = _auid(a)
+    return bool(aumid) and aumid == _auid(b)

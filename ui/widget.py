@@ -19,6 +19,7 @@ from typing import Optional
 from PySide6.QtCore import (
     QEasingCurve,
     QPoint,
+    QPointF,
     QRect,
     QRectF,
     QSize,
@@ -28,9 +29,11 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
+    QCloseEvent,
     QColor,
     QFont,
     QFontMetrics,
+    QGuiApplication,
     QLinearGradient,
     QMouseEvent,
     QPaintEvent,
@@ -52,17 +55,20 @@ WINDOW_SIZE = QSize(372, 122)  # карточка 360×110
 CARD_RADIUS = 14.0
 COVER_MARGIN = 10
 COVER_SIZE = 90
+COVER_RADIUS = 10.0
 TEXT_LEFT = 112  # от левого края карточки
+TEXT_RIGHT_MARGIN = 14  # отступ текста от правого края карточки
 BUTTON_SIZE = 26
 BUTTON_GAP = 8
 
+SCROLL_INTERVAL_MS = 35
 SCROLL_SPEED = 0.8  # px за тик
 SCROLL_GAP = 48  # отступ между концом и началом текста
 
 
 def _elide(text: str, font: QFont, width: int) -> str:
     metrics = QFontMetrics(font)
-    return metrics.elidedText(text, Qt.ElideMiddle, max(0, width))
+    return metrics.elidedText(text, Qt.TextElideMode.ElideRight, max(0, width))
 
 
 def blur_pixmap(src: QPixmap, size: QSize) -> QPixmap:
@@ -101,6 +107,9 @@ class NowPlayingWidget(QWidget):
         self._has_media = False
         self._is_playing = False
         self._cover: Optional[QPixmap] = None
+        # Обложка, уже отмасштабированная под COVER_SIZE (не пересчитывать
+        # SmoothTransformation на каждом кадре прокрутки).
+        self._cover_scaled: Optional[QPixmap] = None
         self._background: Optional[QPixmap] = None
 
         # Fade кнопок
@@ -122,7 +131,7 @@ class NowPlayingWidget(QWidget):
         # Прокрутка заголовка
         self._scroll_offset = 0.0
         self._scroll_timer = QTimer(self)
-        self._scroll_timer.setInterval(35)
+        self._scroll_timer.setInterval(SCROLL_INTERVAL_MS)
         self._scroll_timer.timeout.connect(self._on_scroll_tick)
 
         self._font_title = QFont("Segoe UI", 12, QFont.Weight.DemiBold)
@@ -134,16 +143,30 @@ class NowPlayingWidget(QWidget):
     # ------------------------------------------------------------------
 
     def set_settings(self, settings: Settings) -> None:
-        """Применяет настройки (может пересоздать оконные флаги)."""
-        was_visible = self.isVisible()
+        """Применяет настройки (может пересоздать оконные флаги).
+
+        Видимость пересчитывается заново: смена флага окна скрывает его,
+        а изменение «прятать без медиа» должно сработать сразу.
+        """
         self.settings = settings
-        if self.windowFlags() & Qt.WindowStaysOnTopHint != bool_to_flag(
-            settings.always_on_top
-        ):
-            self.setWindowFlag(Qt.WindowStaysOnTopHint, settings.always_on_top)
-        if was_visible:
-            self.show()
+        on_top = bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
+        if on_top != settings.always_on_top:
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, settings.always_on_top)
+        self._apply_visibility()
         self.update()
+
+    def _should_be_visible(self) -> bool:
+        if self._user_hidden:
+            return False
+        return self._has_media or not self.settings.hide_when_no_media
+
+    def _apply_visibility(self) -> None:
+        """Единое правило видимости: скрыт пользователем > нет медиа > показ."""
+        if self._should_be_visible():
+            if not self.isVisible():
+                self.show()
+        elif self.isVisible():
+            self.hide()
 
     def set_track(self, title: str, artist: str, cover_bytes: Optional[bytes]) -> None:
         """Новые данные трека. Обложка пересчитывается только при её наличии."""
@@ -165,10 +188,7 @@ class NowPlayingWidget(QWidget):
         elif track_changed:
             # Новый трек без обложки — старую не показываем (заглушка).
             self._apply_cover(None)
-        if self._user_hidden:
-            return
-        if not self.isVisible():
-            self.show()
+        self._apply_visibility()
         self.update()
 
     def set_cover(self, cover_bytes: Optional[bytes]) -> None:
@@ -179,24 +199,30 @@ class NowPlayingWidget(QWidget):
             self._user_hidden,
         )
         self._apply_cover(cover_bytes)
-        if self._user_hidden:
-            return
         self.update()
 
+    def _clear_cover(self) -> None:
+        self._cover = None
+        self._cover_scaled = None
+        self._background = None
+
     def _apply_cover(self, cover_bytes: Optional[bytes]) -> None:
-        """Загружает pixmap и размытый фон; None — очистка (заглушка)."""
+        """Загружает pixmap, масштабированную копию и размытый фон; None — заглушка."""
         if not cover_bytes:
-            self._cover = None
-            self._background = None
+            self._clear_cover()
             return
         pixmap = QPixmap()
-        if pixmap.loadFromData(cover_bytes):
-            self._cover = pixmap
-            self._background = blur_pixmap(pixmap, self.size())
-        else:
+        if not pixmap.loadFromData(cover_bytes):
             logger.warning("не удалось декодировать обложку (%dB)", len(cover_bytes))
-            self._cover = None
-            self._background = None
+            self._clear_cover()
+            return
+        self._cover = pixmap
+        self._cover_scaled = pixmap.scaled(
+            QSize(COVER_SIZE, COVER_SIZE),
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._background = blur_pixmap(pixmap, self.size())
 
     def set_playing(self, is_playing: bool) -> None:
         logger.debug("UI ← playback_state_changed: %s", is_playing)
@@ -213,42 +239,44 @@ class NowPlayingWidget(QWidget):
         self._has_media = False
         self._title = ""
         self._artist = ""
-        self._cover = None
-        self._background = None
+        self._clear_cover()
         self._is_playing = False
         self._scroll_offset = 0.0
-        if self._user_hidden:
-            return
-        if self.settings.hide_when_no_media:
-            self.hide()
-        else:
-            self.show()
-            self.update()
+        self._apply_visibility()
+        self.update()
 
     def set_user_hidden(self, hidden: bool) -> None:
         """Скрытие/показ из трея (побеждает над настройкой «прятать без медиа»)."""
         self._user_hidden = bool(hidden)
-        if hidden:
-            self.hide()
-        elif not (self.settings.hide_when_no_media and not self._has_media):
-            self.show()
+        self._apply_visibility()
 
     @property
     def user_hidden(self) -> bool:
         return self._user_hidden
 
     def restore_position(self, x: Optional[int], y: Optional[int]) -> None:
-        """Восстанавливает позицию с клампом к доступным экранам."""
+        """Восстанавливает позицию с клампом к экрану, на котором она лежит.
+
+        Экран ищется по сохранённой точке (а не ``self.screen()``, который до
+        первого показа всегда основной) — иначе на нескольких мониторах окно
+        «перепрыгивало» на основной экран при каждом запуске. Если монитор
+        с сохранённой позицией отключён — окно переносится на основной.
+        """
         if x is None or y is None:
             self._center_bottom_right()
             return
-        screen = self.screen() or None
+        x, y = int(x), int(y)
+        screen = (
+            QGuiApplication.screenAt(QPoint(x + self.width() // 2, y + self.height() // 2))
+            or QGuiApplication.screenAt(QPoint(x, y))
+            or QGuiApplication.primaryScreen()
+        )
         if screen is None:
-            self.move(int(x), int(y))
+            self.move(x, y)
             return
         area = screen.availableGeometry()
-        nx = min(max(int(x), area.left()), area.right() - self.width() + 1)
-        ny = min(max(int(y), area.top()), area.bottom() - self.height() + 1)
+        nx = min(max(x, area.left()), area.right() - self.width() + 1)
+        ny = min(max(y, area.top()), area.bottom() - self.height() + 1)
         self.move(nx, ny)
 
     def save_position(self) -> None:
@@ -276,11 +304,14 @@ class NowPlayingWidget(QWidget):
         )
 
     def _text_rect(self) -> QRect:
+        # Текст занимает всю ширину справа от обложки: кнопки живут в нижней
+        # части карточки и с двумя строками текста не пересекаются.
         card = self._card_rect()
+        left = card.left() + TEXT_LEFT
         return QRect(
-            card.left() + TEXT_LEFT,
+            left,
             card.top() + 14,
-            card.right() - 110 - (card.left() + TEXT_LEFT),
+            card.right() - TEXT_RIGHT_MARGIN - left,
             card.height() - 28,
         )
 
@@ -295,7 +326,7 @@ class NowPlayingWidget(QWidget):
         return rects
 
     def _center_bottom_right(self) -> None:
-        screen = self.screen()
+        screen = QGuiApplication.primaryScreen()
         if screen is None:
             self.move(100, 100)
             return
@@ -362,17 +393,12 @@ class NowPlayingWidget(QWidget):
 
     def _draw_cover(self, painter: QPainter) -> None:
         rect = self._cover_rect()
-        radius = 10.0
         painter.save()
         path = QPainterPath()
-        path.addRoundedRect(rect, radius, radius)
+        path.addRoundedRect(rect, COVER_RADIUS, COVER_RADIUS)
         painter.setClipPath(path)
-        if self._cover is not None and not self._cover.isNull():
-            scaled = self._cover.scaled(
-                rect.size(),
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+        scaled = self._cover_scaled
+        if scaled is not None and not scaled.isNull():
             x = rect.left() + (rect.width() - scaled.width()) // 2
             y = rect.top() + (rect.height() - scaled.height()) // 2
             painter.drawPixmap(QPoint(x, y), scaled)
@@ -383,9 +409,7 @@ class NowPlayingWidget(QWidget):
             painter.fillRect(rect, gradient)
             # нотка-заглушка
             painter.setPen(QColor(255, 255, 255, 120))
-            note_font = QFont("Segoe UI", 26)
-            painter.setFont(note_font)
-            metrics = painter.fontMetrics()
+            painter.setFont(QFont("Segoe UI", 26))
             painter.drawText(
                 rect, Qt.AlignmentFlag.AlignCenter, "\u266a"
             )
@@ -409,14 +433,13 @@ class NowPlayingWidget(QWidget):
 
         title_width = metrics_title.horizontalAdvance(title)
         if title and title_width > area.width() and self._has_media:
-            # Прокрутка: рисуем два раза со сдвигом.
+            # Прокрутка: рисуем два раза со сдвигом. QPointF — субпиксельный
+            # сдвиг (QPoint отбрасывал дробную часть и текст «дёргался»).
             painter.save()
             painter.setClipRect(area)
             x = area.left() - self._scroll_offset
-            painter.drawText(QPoint(x, title_y), title)
-            painter.drawText(
-                QPoint(int(x + title_width + SCROLL_GAP), title_y), title
-            )
+            painter.drawText(QPointF(x, title_y), title)
+            painter.drawText(QPointF(x + title_width + SCROLL_GAP, title_y), title)
             painter.restore()
         else:
             painter.drawText(
@@ -513,12 +536,13 @@ class NowPlayingWidget(QWidget):
         if width <= area.width():
             if self._scroll_offset:
                 self._scroll_offset = 0.0
-                self.update()
+                self.update(area)
             return
-        self._scroll_offset += SCROLL_SPEED * (self._scroll_timer.interval() / 35)
+        self._scroll_offset += SCROLL_SPEED
         if self._scroll_offset > width + SCROLL_GAP:
             self._scroll_offset = 0.0
-        self.update()
+        # Перерисовываем только область текста, а не всю карточку с тенью.
+        self.update(area)
 
     # ------------------------------------------------------------------
     # Мышь: hover, кнопки, перетаскивание
@@ -639,14 +663,13 @@ class NowPlayingWidget(QWidget):
         super().hideEvent(event)
         self._scroll_timer.stop()
 
-    def closeEvent(self, event) -> None:  # noqa: N802
-        # Крестик у безрамочного окна нет, но на всякий случай — сохраняем позицию.
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        # Крестика у безрамочного окна нет, но Alt+F4 работает. Считаем это
+        # скрытием пользователем: иначе окно само всплывало бы на следующем
+        # треке. Вернуть — из трея или повторным запуском приложения.
         self.save_position()
+        self._user_hidden = True
         super().closeEvent(event)
-
-
-def bool_to_flag(value: bool) -> Qt.WindowType:
-    return Qt.WindowType.WindowStaysOnTopHint if value else Qt.WindowType(0)
 
 
 def manhattan(point: QPoint) -> int:
