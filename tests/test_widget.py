@@ -112,6 +112,30 @@ def test_long_title_is_elided_without_animations(widget) -> None:
     assert not widget._marquee_frame.isActive()
 
 
+@pytest.mark.parametrize("glyph", ["play", "pause", "next", "prev"])
+def test_glyphs_fit_button_and_are_centered(qapp, glyph) -> None:
+    """Значки помещаются в кнопку и отцентрованы (play — с оптическим сдвигом)."""
+    from ui.widget import BUTTON_SIZE, glyph_path
+
+    bounds = glyph_path(glyph).boundingRect()
+    assert not bounds.isEmpty()
+    limit = BUTTON_SIZE / 2 - 4  # отступ от края круга
+    assert bounds.left() >= -limit and bounds.right() <= limit
+    assert bounds.top() >= -limit and bounds.bottom() <= limit
+    assert abs(bounds.center().y()) < 0.01
+    tolerance = 1.2 if glyph == "play" else 0.01
+    assert abs(bounds.center().x()) <= tolerance
+
+
+def test_prev_next_are_mirrored(qapp) -> None:
+    from ui.widget import glyph_path
+
+    nxt = glyph_path("next").boundingRect()
+    prv = glyph_path("prev").boundingRect()
+    assert nxt.left() == pytest.approx(-prv.right())
+    assert nxt.width() == pytest.approx(prv.width())
+
+
 def test_restore_position_clamps_to_screen(widget, qapp) -> None:
     from PySide6.QtGui import QGuiApplication
 

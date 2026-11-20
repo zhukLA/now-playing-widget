@@ -130,6 +130,81 @@ def blur_pixmap(src: QPixmap, size: QSize) -> QPixmap:
     )
 
 
+# ---------------------------------------------------------------------------
+# Значки кнопок в духе SF Symbols (macOS): тонкие, со скруглёнными углами
+# ---------------------------------------------------------------------------
+
+#: Половина высоты значков play/pause, px (значок ~11 px — как SF Symbol 13 pt).
+GLYPH_HALF = 5.5
+#: Радиус скругления углов треугольников, px.
+GLYPH_CORNER = 1.4
+
+
+def _rounded_polygon(points: list[tuple[float, float]], radius: float) -> QPainterPath:
+    """Многоугольник со скруглёнными углами (каждый угол — квадратичная кривая)."""
+    n = len(points)
+
+    def toward(a: tuple[float, float], b: tuple[float, float]) -> QPointF:
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(dx, dy) or 1.0
+        r = min(radius, length / 2.0)
+        return QPointF(a[0] + dx / length * r, a[1] + dy / length * r)
+
+    path = QPainterPath()
+    for i, corner in enumerate(points):
+        prev_pt = points[i - 1]
+        next_pt = points[(i + 1) % n]
+        start = toward(corner, prev_pt)
+        end = toward(corner, next_pt)
+        if i == 0:
+            path.moveTo(start)
+        else:
+            path.lineTo(start)
+        path.quadTo(QPointF(*corner), end)
+    path.closeSubpath()
+    return path
+
+
+def _triangle_right(left: float, right: float, half: float) -> QPainterPath:
+    return _rounded_polygon([(left, -half), (right, 0.0), (left, half)], GLYPH_CORNER)
+
+
+def _triangle_left(left: float, right: float, half: float) -> QPainterPath:
+    return _rounded_polygon([(right, -half), (left, 0.0), (right, half)], GLYPH_CORNER)
+
+
+def glyph_path(glyph: str) -> QPainterPath:
+    """Контур значка с центром в (0, 0).
+
+    * play  — play.fill: скруглённый треугольник, сдвинут вправо для
+      оптического центра (у треугольника «центр тяжести» левее середины);
+    * pause — pause.fill: две узкие полоски с круглыми концами;
+    * next/prev — forward.fill / backward.fill: два касающихся треугольника,
+      как в «Сейчас играет» macOS.
+    """
+    h = GLYPH_HALF
+    path = QPainterPath()
+    path.setFillRule(Qt.FillRule.WindingFill)
+    if glyph == "play":
+        path.addPath(_triangle_right(-3.8, 5.6, h))
+    elif glyph == "pause":
+        bar_w, gap = 2.6, 3.0
+        for x in (-gap / 2 - bar_w, gap / 2):
+            path.addRoundedRect(QRectF(x, -h, bar_w, 2 * h), bar_w / 2, bar_w / 2)
+    elif glyph == "next":
+        half = h * 0.78
+        path.addPath(_triangle_right(-6.0, 0.4, half))
+        path.addPath(_triangle_right(-0.4, 6.0, half))
+    else:  # prev
+        half = h * 0.78
+        path.addPath(_triangle_left(-6.0, 0.4, half))
+        path.addPath(_triangle_left(-0.4, 6.0, half))
+    if glyph != "play":
+        # Скругление «съедает» остриё — выравниваем по фактическим границам.
+        path.translate(-path.boundingRect().center().x(), 0.0)
+    return path
+
+
 @dataclass(frozen=True)
 class _Frame:
     """Снимок отображаемого содержимого — «старый» слой при переходе."""
@@ -801,35 +876,7 @@ class NowPlayingWidget(QWidget):
         painter.save()
         painter.translate(center)
         painter.scale(scale, scale)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(color)
-        s = 6.5
-        if glyph == "pause":
-            painter.drawRoundedRect(QRectF(-5.0, -s, 3.4, 2 * s), 1.0, 1.0)
-            painter.drawRoundedRect(QRectF(1.6, -s, 3.4, 2 * s), 1.0, 1.0)
-        elif glyph == "play":
-            path = QPainterPath()
-            path.moveTo(-4.5, -s)
-            path.lineTo(5.5, 0.0)
-            path.lineTo(-4.5, s)
-            path.closeSubpath()
-            painter.drawPath(path)
-        elif glyph == "next":
-            path = QPainterPath()
-            path.moveTo(-5.5, -s)
-            path.lineTo(2.5, 0.0)
-            path.lineTo(-5.5, s)
-            path.closeSubpath()
-            painter.drawPath(path)
-            painter.drawRoundedRect(QRectF(3.6, -s, 2.4, 2 * s), 0.8, 0.8)
-        else:  # prev
-            path = QPainterPath()
-            path.moveTo(5.5, -s)
-            path.lineTo(-2.5, 0.0)
-            path.lineTo(5.5, s)
-            path.closeSubpath()
-            painter.drawPath(path)
-            painter.drawRoundedRect(QRectF(-6.0, -s, 2.4, 2 * s), 0.8, 0.8)
+        painter.fillPath(glyph_path(glyph), color)
         painter.restore()
 
     # ------------------------------------------------------------------
