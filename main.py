@@ -98,7 +98,6 @@ class Application(QObject):
         )
         self.widget.always_on_top_toggled.connect(self._toggle_always_on_top)
         self.widget.autostart_toggled.connect(self._toggle_autostart)
-        self.widget.theme_selected.connect(self._select_theme)
         self.widget.settings_requested.connect(self._open_settings)
         self.widget.quit_requested.connect(self.app.quit)
         self.widget.position_changed.connect(self._save_position)
@@ -186,13 +185,6 @@ class Application(QObject):
 
     def _toggle_always_on_top(self, value: bool) -> None:
         self.settings.always_on_top = bool(value)
-        self._persist()
-        self.widget.set_settings(self.settings)
-
-    def _select_theme(self, theme: str) -> None:
-        if theme == self.settings.theme:
-            return
-        self.settings.theme = theme
         self._persist()
         self.widget.set_settings(self.settings)
 

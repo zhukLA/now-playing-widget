@@ -75,17 +75,8 @@ def test_to_dict_shape() -> None:
         "autostart_enabled",
         "x",
         "y",
-        "theme",
     }
     json.dumps(d)  # должен быть сериализуем
-
-
-def test_theme_default_is_neon_and_validated() -> None:
-    assert Settings().theme == settings_mod.THEME_NEON
-    assert Settings.from_dict({}).theme == settings_mod.THEME_NEON  # старый settings.json
-    assert Settings.from_dict({"theme": "classic"}).theme == "classic"
-    assert Settings.from_dict({"theme": "rainbow"}).theme == settings_mod.DEFAULT_THEME
-    assert Settings.from_dict({"theme": 42}).theme == settings_mod.DEFAULT_THEME
 
 
 def test_default_config_dir_uses_appdata(monkeypatch) -> None:

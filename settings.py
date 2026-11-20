@@ -20,12 +20,6 @@ logger = logging.getLogger("npw.settings")
 APP_DIR_NAME = "NowPlayingWidget"
 SETTINGS_FILE_NAME = "settings.json"
 
-#: Темы оформления виджета (первая — по умолчанию).
-THEME_NEON = "neon"
-THEME_CLASSIC = "classic"
-THEMES = (THEME_NEON, THEME_CLASSIC)
-DEFAULT_THEME = THEME_NEON
-
 # Имя значения в ветке Run. Должно совпадать с installer.iss.
 AUTOSTART_RUN_VALUE_NAME = "NowPlayingWidget"
 AUTOSTART_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -45,22 +39,19 @@ class Settings:
     autostart_enabled: bool = False
     x: int | None = None
     y: int | None = None
-    theme: str = DEFAULT_THEME
 
     @classmethod
     def from_dict(cls, data: Any) -> "Settings":
         """Строит настройки из (возможно битого) словаря: неизвестные ключи игнорируются."""
         if not isinstance(data, dict):
             return cls()
-        known = {f.name for f in fields(cls)}
+        known = {f.name: f.type for f in fields(cls)}
         values: dict[str, Any] = {}
         for key, value in data.items():
             if key not in known:
                 continue
             if key in ("always_on_top", "hide_when_no_media", "autostart_enabled"):
                 values[key] = bool(value)
-            elif key == "theme":
-                values[key] = value if value in THEMES else DEFAULT_THEME
             elif key in ("x", "y"):
                 if value is None:
                     values[key] = None
@@ -78,7 +69,6 @@ class Settings:
             "autostart_enabled": self.autostart_enabled,
             "x": self.x,
             "y": self.y,
-            "theme": self.theme,
         }
 
 

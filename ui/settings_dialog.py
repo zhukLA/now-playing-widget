@@ -5,21 +5,17 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QDialog,
     QDialogButtonBox,
-    QFormLayout,
     QGroupBox,
     QVBoxLayout,
 )
 
-from settings import THEMES, Settings
-
-THEME_LABELS = {"neon": "Неон", "classic": "Классика"}
+from settings import Settings
 
 
 class SettingsDialog(QDialog):
-    """Флажки поведения (поверх окон / прятать без медиа / автозапуск) и тема."""
+    """Три флажка: поверх всех окон / прятать без медиа / автозапуск."""
 
     def __init__(self, settings: Settings, parent=None) -> None:
         super().__init__(parent)
@@ -35,21 +31,11 @@ class SettingsDialog(QDialog):
         self._hide.setChecked(settings.hide_when_no_media)
         self._autostart.setChecked(settings.autostart_enabled)
 
-        self._theme = QComboBox(self)
-        for theme in THEMES:
-            self._theme.addItem(THEME_LABELS.get(theme, theme), theme)
-        index = self._theme.findData(settings.theme)
-        self._theme.setCurrentIndex(max(0, index))
-
-        behaviour = QGroupBox("Поведение", self)
-        inner = QVBoxLayout(behaviour)
+        group = QGroupBox("Поведение", self)
+        inner = QVBoxLayout(group)
         inner.addWidget(self._top)
         inner.addWidget(self._hide)
         inner.addWidget(self._autostart)
-
-        look = QGroupBox("Оформление", self)
-        form = QFormLayout(look)
-        form.addRow("Тема:", self._theme)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
@@ -59,8 +45,7 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(behaviour)
-        layout.addWidget(look)
+        layout.addWidget(group)
         layout.addWidget(buttons)
 
     @property
@@ -70,5 +55,4 @@ class SettingsDialog(QDialog):
         s.always_on_top = self._top.isChecked()
         s.hide_when_no_media = self._hide.isChecked()
         s.autostart_enabled = self._autostart.isChecked()
-        s.theme = self._theme.currentData()
         return s
