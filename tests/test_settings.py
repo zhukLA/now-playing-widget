@@ -81,7 +81,8 @@ def test_to_dict_shape() -> None:
 
 def test_default_config_dir_uses_appdata(monkeypatch) -> None:
     monkeypatch.setenv("APPDATA", r"C:\Tmp\AppData")
-    assert settings_mod.default_config_dir() == Path(r"C:\Tmp\AppData\NowPlayingWidget")
+    # Сравнение через Path(...) / name — тест проходит и вне Windows.
+    assert settings_mod.default_config_dir() == Path(r"C:\Tmp\AppData") / "NowPlayingWidget"
 
 
 def test_default_config_dir_fallback_home(monkeypatch) -> None:

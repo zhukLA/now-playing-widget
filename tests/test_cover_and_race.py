@@ -13,8 +13,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 
-import pytest
-
 import media_controller as mc
 from media_controller import MediaController
 
@@ -259,6 +257,105 @@ def test_cover_retry_stops_on_track_change(monkeypatch):
         assert changed == []
 
     asyncio.run(main())
+
+
+# ---------------------------------------------------------------------------
+# Новый трек, пришедший через playback_info_changed (with_cover=False)
+# ---------------------------------------------------------------------------
+
+
+def test_new_track_reads_cover_even_without_cover_flag():
+    """Смена трека, замеченная по playback_info_changed, тоже несёт обложку."""
+    props = FakeProps(title="New", artist="Artist", thumbnail=object())
+    controller = _controller(FakeSession(props))
+
+    async def fake_read(thumbnail):
+        return b"cover"
+
+    controller._read_cover = fake_read
+    tracks = _collect(controller.track_changed)
+
+    async def main():
+        controller._refresh_seq = 1
+        await controller._refresh(with_cover=False, seq=1)
+
+    asyncio.run(main())
+    assert tracks == [("New", "Artist", b"cover")]
+
+
+# ---------------------------------------------------------------------------
+# Сессия «пропала», но менеджер отдаёт её же (новой winrt-обёрткой)
+# ---------------------------------------------------------------------------
+
+
+class BrokenSession(FakeSession):
+    """Сессия, у которой свойства не читаются."""
+
+    async def try_get_media_properties_async(self):
+        raise OSError("RPC server unavailable")
+
+    def add_media_properties_changed(self, handler):
+        return 1
+
+    def add_playback_info_changed(self, handler):
+        return 2
+
+    def remove_media_properties_changed(self, token):
+        pass
+
+    def remove_playback_info_changed(self, token):
+        pass
+
+
+class FakeManager:
+    """Как winrt: каждый вызов отдаёт НОВУЮ обёртку той же сессии."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def get_current_session(self):
+        self.calls += 1
+        return BrokenSession(FakeProps())
+
+
+def test_session_gone_same_aumid_does_not_loop(monkeypatch):
+    """Раньше: refresh → ошибка → переподписка на «новую» (ту же) сессию →
+    refresh → … бесконечно. Теперь — один переход в no_media."""
+    monkeypatch.setattr(mc, "REFRESH_DEBOUNCE", 0.01)
+    controller = _controller(BrokenSession(FakeProps()))
+    controller._manager = FakeManager()
+    no_media = _collect(controller.no_media)
+
+    async def main():
+        controller._refresh_seq = 1
+        await controller._refresh(with_cover=True, seq=1)
+        await asyncio.sleep(0.1)  # дать шанс зациклиться, если баг вернётся
+
+    asyncio.run(main())
+    assert controller._manager.calls == 1
+    assert no_media == [()]
+    assert controller._session is None
+
+
+def test_session_gone_switches_to_other_app(monkeypatch):
+    other = FakeSession(FakeProps(title="Other", artist="App"))
+    other.source_app_user_model_id = "Spotify"
+    other.add_media_properties_changed = lambda h: 1
+    other.add_playback_info_changed = lambda h: 2
+
+    class Manager:
+        def get_current_session(self):
+            return other
+
+    controller = _controller(BrokenSession(FakeProps()))
+    controller._manager = Manager()
+    scheduled: list[bool] = []
+    monkeypatch.setattr(
+        controller, "_schedule_refresh", lambda **kw: scheduled.append(kw["with_cover"])
+    )
+    controller._handle_session_gone()
+    assert controller._session is other
+    assert scheduled == [True]
 
 
 # ---------------------------------------------------------------------------

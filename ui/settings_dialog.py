@@ -15,12 +15,12 @@ from settings import Settings
 
 
 class SettingsDialog(QDialog):
-    """Три флагка: поверх всех окон / прятать без медиа / автозапуск."""
+    """Три флажка: поверх всех окон / прятать без медиа / автозапуск."""
 
     def __init__(self, settings: Settings, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Настройки — Now Playing")
-        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
 
         self._original = settings
         self._top = QCheckBox("Поверх всех окон", self)
@@ -37,7 +37,10 @@ class SettingsDialog(QDialog):
         inner.addWidget(self._hide)
         inner.addWidget(self._autostart)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            self,
+        )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 

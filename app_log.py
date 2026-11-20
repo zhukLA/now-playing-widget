@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
@@ -74,3 +76,33 @@ def setup_logging(
 
     _configured = True
     return path
+
+
+def install_excepthook() -> None:
+    """Необработанные исключения — в лог.
+
+    В windowed-сборке (PyInstaller, console=False) stderr отсутствует, и
+    исключение в Qt-слоте или потоке иначе бесследно пропадает.
+    """
+    log = logging.getLogger("npw.crash")
+    previous = sys.excepthook
+
+    def hook(exc_type, exc, tb) -> None:
+        if issubclass(exc_type, KeyboardInterrupt):
+            previous(exc_type, exc, tb)
+            return
+        log.critical("необработанное исключение", exc_info=(exc_type, exc, tb))
+        if sys.stderr is not None:
+            previous(exc_type, exc, tb)
+
+    def thread_hook(args: threading.ExceptHookArgs) -> None:
+        if args.exc_type is SystemExit:
+            return
+        log.critical(
+            "необработанное исключение в потоке %s",
+            getattr(args.thread, "name", "?"),
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = hook
+    threading.excepthook = thread_hook
