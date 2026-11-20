@@ -94,6 +94,8 @@ class Application(QObject):
                 "prev": self.controller.previous,
                 "play_pause": self.controller.play_pause,
                 "next": self.controller.next,
+                "shuffle": self.controller.toggle_shuffle,
+                "repeat": self.controller.cycle_repeat,
             }
         )
         self.widget.always_on_top_toggled.connect(self._toggle_always_on_top)
@@ -107,6 +109,7 @@ class Application(QObject):
         self.controller.cover_changed.connect(self.widget.set_cover)
         self.controller.playback_state_changed.connect(self.widget.set_playing)
         self.controller.no_media.connect(self.widget.set_no_media)
+        self.controller.modes_changed.connect(self.widget.set_modes)
 
     # ------------------------------------------------------------------
     # Трей

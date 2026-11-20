@@ -112,14 +112,17 @@ def test_long_title_is_elided_without_animations(widget) -> None:
     assert not widget._marquee_frame.isActive()
 
 
-@pytest.mark.parametrize("glyph", ["play", "pause", "next", "prev"])
+@pytest.mark.parametrize(
+    "glyph", ["play", "pause", "next", "prev", "shuffle", "repeat", "repeat_one"]
+)
 def test_glyphs_fit_button_and_are_centered(qapp, glyph) -> None:
     """Значки помещаются в кнопку и отцентрованы (play — с оптическим сдвигом)."""
-    from ui.widget import BUTTON_SIZE, glyph_path
+    from ui.widget import BUTTON_SIZE, LINE_GLYPHS, SECONDARY_SIZE, glyph_path
 
     bounds = glyph_path(glyph).boundingRect()
     assert not bounds.isEmpty()
-    limit = BUTTON_SIZE / 2 - 4  # отступ от края круга
+    size = SECONDARY_SIZE if glyph in LINE_GLYPHS else BUTTON_SIZE
+    limit = size / 2 - (4 if glyph not in LINE_GLYPHS else 3)  # отступ от края
     assert bounds.left() >= -limit and bounds.right() <= limit
     assert bounds.top() >= -limit and bounds.bottom() <= limit
     assert abs(bounds.center().y()) < 0.01
@@ -145,3 +148,89 @@ def test_restore_position_clamps_to_screen(widget, qapp) -> None:
     assert widget.y() + widget.height() - 1 <= area.bottom()
     widget.restore_position(area.left() + 10, area.top() + 20)
     assert (widget.x(), widget.y()) == (area.left() + 10, area.top() + 20)
+
+
+# ---------------------------------------------------------------------------
+# Повтор / перемешивание
+# ---------------------------------------------------------------------------
+
+
+def test_button_row_layout(widget) -> None:
+    rects = widget._button_rects()
+    assert list(rects) == ["shuffle", "prev", "play_pause", "next", "repeat"]
+    ordered = list(rects.values())
+    for a, b in zip(ordered, ordered[1:]):
+        assert a.right() < b.left(), "кнопки не перекрываются и идут слева направо"
+    card = widget._card_rect()
+    assert all(card.contains(r) for r in ordered)
+    assert rects["shuffle"].left() > widget._cover_rect().right()
+    centers = {r.center().y() for r in ordered}
+    assert max(centers) - min(centers) <= 1, "кнопки на одной линии"
+
+
+def _modes(**kw):
+    from media_controller import PlaybackModes
+
+    return PlaybackModes(**kw)
+
+
+def test_mode_buttons_disabled_until_supported(widget) -> None:
+    widget.set_track("T", "A", None)
+    assert not widget._button_enabled("repeat")
+    assert not widget._button_enabled("shuffle")
+    widget.set_modes(_modes(repeat="off", shuffle=False, repeat_supported=True,
+                            shuffle_supported=True))
+    assert widget._button_enabled("repeat") and widget._button_enabled("shuffle")
+    widget.set_no_media()
+    assert not widget._button_enabled("repeat")
+
+
+def test_mode_indicators_follow_state(widget) -> None:
+    widget.set_track("T", "A", None)
+    widget.set_modes(_modes(repeat="one", shuffle=True, repeat_supported=True,
+                            shuffle_supported=True))
+    assert widget._shuffle_on.value == 1.0
+    assert widget._repeat_on.value == 1.0 and widget._repeat_one.value == 1.0
+    widget.set_modes(_modes(repeat="all", shuffle=False, repeat_supported=True,
+                            shuffle_supported=True))
+    assert widget._shuffle_on.value == 0.0
+    assert widget._repeat_on.value == 1.0 and widget._repeat_one.value == 0.0
+    assert not widget.grab().isNull()
+
+
+def test_mode_button_click_only_when_supported(widget) -> None:
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    clicks: list[str] = []
+    widget.set_button_handlers({"repeat": lambda: clicks.append("repeat")})
+    widget.set_track("T", "A", None)
+    pos = QPointF(widget._button_rects()["repeat"].center())
+
+    def click():
+        for kind, buttons in (
+            (QEvent.Type.MouseButtonPress, Qt.MouseButton.LeftButton),
+            (QEvent.Type.MouseButtonRelease, Qt.MouseButton.NoButton),
+        ):
+            event = QMouseEvent(kind, pos, pos, Qt.MouseButton.LeftButton, buttons,
+                                Qt.KeyboardModifier.NoModifier)
+            if kind == QEvent.Type.MouseButtonPress:
+                widget.mousePressEvent(event)
+            else:
+                widget.mouseReleaseEvent(event)
+
+    click()
+    assert clicks == [], "плеер не поддерживает повтор — клик игнорируется"
+    widget.set_modes(_modes(repeat="off", shuffle=False, repeat_supported=True,
+                            shuffle_supported=False))
+    click()
+    assert clicks == ["repeat"]
+
+
+def test_mode_tooltips(widget) -> None:
+    widget.set_track("T", "A", None)
+    assert "не поддерживает" in widget._button_tooltip("repeat")
+    widget.set_modes(_modes(repeat="one", shuffle=True, repeat_supported=True,
+                            shuffle_supported=True))
+    assert widget._button_tooltip("repeat") == "Повтор: один трек"
+    assert widget._button_tooltip("shuffle") == "Перемешивание: вкл"

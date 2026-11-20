@@ -50,6 +50,7 @@ from PySide6.QtGui import (
     QPaintEvent,
     QPainter,
     QPainterPath,
+    QPainterPathStroker,
     QPen,
     QPixmap,
     QResizeEvent,
@@ -78,6 +79,14 @@ TEXT_LEFT = 112  # от левого края карточки
 TEXT_RIGHT_MARGIN = 14  # отступ текста от правого края карточки
 BUTTON_SIZE = 26
 BUTTON_GAP = 8
+#: Второстепенные кнопки (перемешивание, повтор) — меньше и без подложки.
+SECONDARY_SIZE = 22
+SECONDARY_GAP = 6
+SECONDARY_BUTTONS = ("shuffle", "repeat")
+#: Яркость значков второстепенных кнопок: выкл / вкл / недоступно.
+MODE_ICON_OFF = 0.5
+MODE_ICON_DISABLED = 0.22
+MODE_MS = 200
 
 NO_MEDIA_TITLE = "Нет воспроизведения"
 NO_MEDIA_ARTIST = "Запустите музыку или видео"
@@ -108,7 +117,9 @@ MARQUEE_GAP = 48  # отступ между концом и началом те�
 MARQUEE_FADE = 18  # ширина растворения текста у краёв, px
 MARQUEE_FRAME_MS = 16  # ~60 кадров/с
 
-BUTTON_NAMES = ("prev", "play_pause", "next")
+BUTTON_NAMES = ("shuffle", "prev", "play_pause", "next", "repeat")
+
+REPEAT_LABELS = {"off": "выкл", "all": "все треки", "one": "один трек"}
 
 
 def _elide(text: str, font: QFont, width: int) -> str:
@@ -199,9 +210,69 @@ def glyph_path(glyph: str) -> QPainterPath:
         half = h * 0.78
         path.addPath(_triangle_left(-6.0, 0.4, half))
         path.addPath(_triangle_left(-0.4, 6.0, half))
+    if glyph in LINE_GLYPHS:
+        path = _line_glyph(glyph)
     if glyph != "play":
         # Скругление «съедает» остриё — выравниваем по фактическим границам.
         path.translate(-path.boundingRect().center().x(), 0.0)
+    return path
+
+
+#: Линейные значки (обводка, как SF Symbols shuffle / repeat / repeat.1).
+LINE_GLYPHS = ("shuffle", "repeat", "repeat_one")
+GLYPH_STROKE = 1.5
+
+
+def _stroked(path: QPainterPath, width: float) -> QPainterPath:
+    """Обводка → заливаемый контур (рисуется тем же fillPath, что и остальные)."""
+    stroker = QPainterPathStroker()
+    stroker.setWidth(width)
+    stroker.setCapStyle(Qt.PenCapStyle.RoundCap)
+    stroker.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    outline = stroker.createStroke(path)
+    outline.setFillRule(Qt.FillRule.WindingFill)
+    return outline
+
+
+def _line_glyph(glyph: str) -> QPainterPath:
+    line = QPainterPath()
+    if glyph == "shuffle":
+        # Две пересекающиеся стрелки слева направо.
+        for y in (-3.0, 3.0):
+            line.moveTo(-6.0, y)
+            line.lineTo(-3.2, y)
+            line.cubicTo(-0.4, y, -0.4, -y, 2.4, -y)
+            line.lineTo(5.4, -y)
+            line.moveTo(3.4, -y - 2.0)
+            line.lineTo(5.5, -y)
+            line.lineTo(3.4, -y + 2.0)
+    else:
+        # Петля из двух стрелок: верхняя вправо, нижняя влево. Высота петли
+        # с запасом — внутри должна поместиться «1» у repeat_one.
+        y = 3.6
+        line.moveTo(-5.6, 1.3)
+        line.lineTo(-5.6, -y + 2.0)
+        line.quadTo(-5.6, -y, -3.6, -y)
+        line.lineTo(5.2, -y)
+        line.moveTo(3.3, -y - 1.9)
+        line.lineTo(5.3, -y)
+        line.lineTo(3.3, -y + 1.9)
+        line.moveTo(5.6, -1.3)
+        line.lineTo(5.6, y - 2.0)
+        line.quadTo(5.6, y, 3.6, y)
+        line.lineTo(-5.2, y)
+        line.moveTo(-3.3, y - 1.9)
+        line.lineTo(-5.3, y)
+        line.lineTo(-3.3, y + 1.9)
+    path = _stroked(line, GLYPH_STROKE)
+    if glyph == "repeat_one":
+        # Маленькая «1» по центру петли (repeat.1).
+        one = QPainterPath()
+        one.moveTo(-0.8, -0.8)
+        one.lineTo(0.3, -1.6)
+        one.lineTo(0.3, 1.6)
+        path = path.united(_stroked(one, 1.0))
+        path.setFillRule(Qt.FillRule.WindingFill)
     return path
 
 
@@ -289,6 +360,14 @@ class NowPlayingWidget(QWidget):
         self._press = {n: Tween(0.0, repaint, enabled=enabled, parent=self) for n in BUTTON_NAMES}
         # 0 — значок play, 1 — pause.
         self._play_morph = Tween(0.0, repaint, enabled=enabled, parent=self)
+        # Повтор/перемешивание: что сообщает плеер и плавная индикация.
+        self._repeat: Optional[str] = None
+        self._shuffle: Optional[bool] = None
+        self._repeat_supported = False
+        self._shuffle_supported = False
+        self._shuffle_on = Tween(0.0, repaint, enabled=enabled, parent=self)
+        self._repeat_on = Tween(0.0, repaint, enabled=enabled, parent=self)
+        self._repeat_one = Tween(0.0, repaint, enabled=enabled, parent=self)
         self._cover_scale = Tween(COVER_SCALE_PAUSED, repaint, enabled=enabled, parent=self)
 
         # Бегущая строка: пауза → прокрутка по времени → пауза …
@@ -389,6 +468,25 @@ class NowPlayingWidget(QWidget):
         )
         self.update()
 
+    def set_modes(self, modes) -> None:
+        """Повтор/перемешивание (PlaybackModes из media_controller, duck typing)."""
+        repeat = getattr(modes, "repeat", None)
+        shuffle = getattr(modes, "shuffle", None)
+        self._repeat = repeat if repeat in REPEAT_LABELS else None
+        self._shuffle = None if shuffle is None else bool(shuffle)
+        self._repeat_supported = bool(getattr(modes, "repeat_supported", False))
+        self._shuffle_supported = bool(getattr(modes, "shuffle_supported", False))
+        logger.debug(
+            "UI ← modes_changed: repeat=%s shuffle=%s", self._repeat, self._shuffle
+        )
+        self._shuffle_on.to(1.0 if self._shuffle else 0.0, MODE_MS, ease_in_out_cubic)
+        self._repeat_on.to(
+            1.0 if self._repeat in ("all", "one") else 0.0, MODE_MS, ease_in_out_cubic
+        )
+        self._repeat_one.to(1.0 if self._repeat == "one" else 0.0, MODE_MS, ease_in_out_cubic)
+        self._update_tooltip()
+        self.update()
+
     def set_no_media(self) -> None:
         """Медиа нет: скрыться (по настройке) или показать заглушку."""
         logger.info(
@@ -403,6 +501,7 @@ class NowPlayingWidget(QWidget):
         self._artist = ""
         self._apply_cover(None)
         self.set_playing(False)
+        self.set_modes(None)  # нет плеера — нет и режимов
         self._restart_marquee()
         self._apply_visibility()
         self.update()
@@ -582,14 +681,48 @@ class NowPlayingWidget(QWidget):
         )
 
     def _button_rects(self) -> dict[str, QRect]:
+        """Ряд кнопок справа внизу: ⤮  ⏪ ▶ ⏩  🔁 (как в Apple Music)."""
         card = self._card_rect()
-        right = card.right() - 10
-        bottom = card.bottom() - 12 - BUTTON_SIZE
-        rects = {}
-        for i, name in enumerate(("next", "play_pause", "prev")):
-            x = right - i * (BUTTON_SIZE + BUTTON_GAP) - BUTTON_SIZE
-            rects[name] = QRect(x, bottom, BUTTON_SIZE, BUTTON_SIZE)
-        return rects
+        top = card.bottom() - 12 - BUTTON_SIZE
+        center_y = top + BUTTON_SIZE // 2
+        secondary_top = center_y - SECONDARY_SIZE // 2
+        rects: dict[str, QRect] = {}
+        x = card.right() - 10 - SECONDARY_SIZE
+        rects["repeat"] = QRect(x, secondary_top, SECONDARY_SIZE, SECONDARY_SIZE)
+        x -= SECONDARY_GAP
+        for name in ("next", "play_pause", "prev"):
+            x -= BUTTON_SIZE
+            rects[name] = QRect(x, top, BUTTON_SIZE, BUTTON_SIZE)
+            x -= BUTTON_GAP
+        x += BUTTON_GAP - SECONDARY_GAP - SECONDARY_SIZE
+        rects["shuffle"] = QRect(x, secondary_top, SECONDARY_SIZE, SECONDARY_SIZE)
+        return {name: rects[name] for name in BUTTON_NAMES}
+
+    def _button_enabled(self, name: str) -> bool:
+        if not self._has_media:
+            return False
+        if name == "shuffle":
+            return self._shuffle_supported
+        if name == "repeat":
+            return self._repeat_supported
+        return True
+
+    def _button_tooltip(self, name: str) -> str:
+        if name == "shuffle":
+            if not self._shuffle_supported:
+                return "Перемешивание — плеер не поддерживает"
+            return "Перемешивание: " + ("вкл" if self._shuffle else "выкл")
+        if name == "repeat":
+            if not self._repeat_supported:
+                return "Повтор — плеер не поддерживает"
+            return "Повтор: " + REPEAT_LABELS.get(self._repeat or "off", "выкл")
+        if name == "play_pause":
+            return "Пауза" if self._is_playing else "Воспроизвести"
+        return "Предыдущий трек" if name == "prev" else "Следующий трек"
+
+    def _update_tooltip(self) -> None:
+        name = self._hover_button
+        self.setToolTip(self._button_tooltip(name) if name and self._has_media else "")
 
     def _button_at(self, pos: QPoint) -> Optional[str]:
         for name, rect in self._button_rects().items():
@@ -853,6 +986,11 @@ class NowPlayingWidget(QWidget):
             painter.scale(scale, scale)
             painter.translate(-center)
 
+            if name in SECONDARY_BUTTONS:
+                self._draw_mode_button(painter, name, QRectF(rect), center, alpha, hover)
+                painter.restore()
+                continue
+
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(255, 255, 255, int((30 + 55 * hover) * alpha)))
             painter.drawEllipse(QRectF(rect))
@@ -866,6 +1004,42 @@ class NowPlayingWidget(QWidget):
                 self._draw_glyph(painter, name, center, icon_alpha, 1.0)
             painter.restore()
         painter.restore()
+
+    def _draw_mode_button(
+        self,
+        painter: QPainter,
+        name: str,
+        rect: QRectF,
+        center: QPointF,
+        alpha: float,
+        hover: float,
+    ) -> None:
+        """Перемешивание/повтор: без подложки, яркий значок и точка — «включено»."""
+        enabled = self._button_enabled(name)
+        on = (self._shuffle_on if name == "shuffle" else self._repeat_on).value
+        if enabled:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, int(55 * hover * alpha)))
+            painter.drawEllipse(rect)
+            brightness = MODE_ICON_OFF + (1.0 - MODE_ICON_OFF) * max(on, 0.35 * hover)
+        else:
+            brightness = MODE_ICON_DISABLED
+            on = 0.0
+        icon_alpha = 255.0 * brightness * alpha
+
+        if name == "shuffle":
+            self._draw_glyph(painter, "shuffle", center, icon_alpha, 1.0)
+        else:
+            one = self._repeat_one.value if enabled else 0.0
+            self._draw_glyph(painter, "repeat", center, icon_alpha * (1.0 - one), 1.0)
+            self._draw_glyph(painter, "repeat_one", center, icon_alpha * one, 1.0)
+
+        if on > 0.01:
+            # Точка под значком — режим включён (как в Apple Music).
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, int(235 * on * alpha)))
+            radius = 1.4 * (0.6 + 0.4 * on)
+            painter.drawEllipse(QPointF(center.x(), rect.bottom() - 1.5), radius, radius)
 
     def _draw_glyph(
         self, painter: QPainter, glyph: str, center: QPointF, alpha: float, scale: float
@@ -939,6 +1113,7 @@ class NowPlayingWidget(QWidget):
         if name is not None:
             self._hover[name].to(1.0, HOVER_IN_MS, ease_out_cubic)
         self._hover_button = name
+        self._update_tooltip()
 
     def _release_press(self) -> None:
         if self._pressed_button is not None:
@@ -968,7 +1143,7 @@ class NowPlayingWidget(QWidget):
             self._press_global = event.globalPosition().toPoint()
             self._drag_offset = self.pos()
             name = self._button_at(event.position().toPoint())
-            if name is not None and self._has_media:
+            if name is not None and self._button_enabled(name):
                 self._pressed_button = name
                 self._press[name].to(1.0, PRESS_MS, ease_out_cubic)
             event.accept()
