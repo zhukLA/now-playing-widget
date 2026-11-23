@@ -9,10 +9,11 @@ from __future__ import annotations
 import logging
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from PySide6.QtCore import QObject, QTimer
+from PySide6.QtCore import QCoreApplication, QObject, QTimer
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
@@ -250,8 +251,16 @@ def _send_show_command(name: str = INSTANCE_SERVER_NAME, timeout_ms: int = 400) 
         return False
     socket.write(SHOW_COMMAND)
     socket.flush()
-    socket.waitForBytesWritten(timeout_ms)
+    # Сокет живёт только до выхода из функции, а на Windows запись в канал
+    # асинхронна: если уничтожить его раньше времени, команда теряется и
+    # окно первого экземпляра не поднимается. Дожидаемся записи и закрытия.
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while socket.bytesToWrite() > 0 and time.monotonic() < deadline:
+        if not socket.waitForBytesWritten(50):
+            QCoreApplication.processEvents()
     socket.disconnectFromServer()
+    if socket.state() != QLocalSocket.LocalSocketState.UnconnectedState:
+        socket.waitForDisconnected(timeout_ms)
     return True
 
 
