@@ -229,6 +229,7 @@ now-playing-widget/
 ├── main.py                 # точка входа: single-instance, трей, связка UI и контроллера
 ├── media_controller.py     # SMTC + asyncio-цикл в QThread + MOCK-режим
 ├── settings.py             # JSON-настройки в %APPDATA%\NowPlayingWidget\ (+ автозапуск)
+├── audio_volume.py         # системная громкость Windows (ctypes/COM, без зависимостей)
 ├── app_log.py              # лог-файл с ротацией + перехват необработанных исключений
 ├── ui/
 │   ├── widget.py           # окно виджета (paintEvent: тень, скругления, кнопки, анимации)
@@ -236,7 +237,8 @@ now-playing-widget/
 │   └── settings_dialog.py  # диалог настроек
 ├── assets/icon.ico         # иконка (генерируется tools/generate_icon.py)
 ├── tools/generate_icon.py  # разовый скрипт генерации иконки (PySide6)
-├── tests/                  # pytest: настройки, SMTC-обвязка, гонки, виджет, single-instance
+├── tests/                  # pytest: настройки, SMTC-обвязка, гонки, виджет, single-instance,
+│                           #         размер/громкость/кольцо прогресса
 ├── .github/workflows/      # CI: pytest на Windows
 ├── requirements.txt        # runtime-зависимости
 ├── requirements-dev.txt    # + pytest, pyinstaller

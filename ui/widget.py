@@ -368,11 +368,6 @@ def ring_path(rect: QRectF, radius: float) -> QPainterPath:
     return path
 
 
-def format_time(seconds: float) -> str:
-    total = max(0, int(seconds))
-    return f"{total // 60}:{total % 60:02d}"
-
-
 @dataclass(frozen=True)
 class _Frame:
     """Снимок отображаемого содержимого — «старый» слой при переходе."""
@@ -966,7 +961,8 @@ class NowPlayingWidget(QWidget):
 
     def _extra_rects(self) -> dict[str, QRect]:
         rects = {"close": self._close_rect()}
-        if not self._mini:
+        # Без системной громкости значок не показываем и не обрабатываем.
+        if not self._mini and self._volume_backend.available:
             rects["volume"] = self._volume_icon_rect()
         return rects
 
@@ -1204,6 +1200,8 @@ class NowPlayingWidget(QWidget):
         return 0.0 if self._volume_muted else self._volume_level
 
     def _draw_volume(self, painter: QPainter) -> None:
+        if not self._volume_backend.available:
+            return
         alpha = self._buttons.value
         popup = self._volume_open.value
         if alpha <= 0.001 and popup <= 0.001:

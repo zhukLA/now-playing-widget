@@ -318,3 +318,13 @@ def test_real_no_media_still_hides_after_grace(make_widget, pump, monkeypatch) -
     w = make_widget(Settings(hide_when_no_media=True))
     w.set_no_media()
     assert pump(lambda: not w.isVisible(), timeout=1.0)
+
+
+def test_volume_icon_hidden_when_system_volume_unavailable(make_widget) -> None:
+    vol = FakeVolume()
+    vol.available = False
+    w = make_widget(volume=vol)
+    assert "volume" not in w._extra_rects()
+    w._mouse_inside = True
+    w._update_volume_hover(w._volume_icon_rect().center())
+    assert w._volume_open.value == 0.0
