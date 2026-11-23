@@ -295,3 +295,26 @@ def test_parse_timeline_respects_start_offset() -> None:
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     pos, dur = parse_timeline(_props(40.0, 160.0, now, start=10.0), False, now)
     assert (pos, dur) == (pytest.approx(30.0), pytest.approx(150.0))
+
+
+# --- провал «нет медиа» между треками --------------------------------------
+
+
+def test_gap_between_tracks_does_not_hide_widget(make_widget, pump) -> None:
+    """Браузер на ~1 с сообщает «сессии нет» при смене трека — не прятаться."""
+    w = make_widget(Settings(hide_when_no_media=True))
+    assert w.isVisible()
+    w.set_no_media()
+    assert w.isVisible(), "реакция должна быть отложена"
+    w.set_track("Next", "Artist", None)
+    pump(lambda: False, timeout=0.2)
+    assert w.isVisible() and w._has_media
+
+
+def test_real_no_media_still_hides_after_grace(make_widget, pump, monkeypatch) -> None:
+    import ui.widget as widget_module
+
+    monkeypatch.setattr(widget_module, "NO_MEDIA_GRACE_MS", 50)
+    w = make_widget(Settings(hide_when_no_media=True))
+    w.set_no_media()
+    assert pump(lambda: not w.isVisible(), timeout=1.0)

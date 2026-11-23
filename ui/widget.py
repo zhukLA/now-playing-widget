@@ -139,6 +139,9 @@ MARQUEE_GAP = 48  # отступ между концом и началом те�
 MARQUEE_FADE = 18  # ширина растворения текста у краёв, px
 MARQUEE_FRAME_MS = 16  # ~60 кадров/с
 
+#: Сколько ждать, прежде чем признать «медиа нет» (пауза между треками), мс.
+NO_MEDIA_GRACE_MS = 2500
+
 BUTTON_NAMES = ("shuffle", "prev", "play_pause", "next", "repeat")
 #: Кнопки, которые есть в мини-режиме.
 MINI_BUTTONS = ("prev", "play_pause", "next")
@@ -475,6 +478,10 @@ class NowPlayingWidget(QWidget):
         self._volume_open = Tween(0.0, repaint, enabled=enabled, parent=self)
         self._grip_hover = Tween(0.0, repaint, enabled=enabled, parent=self)
         self._grip_active = False
+        # Отложенное «нет медиа» (см. set_no_media).
+        self._no_media_timer = QTimer(self)
+        self._no_media_timer.setSingleShot(True)
+        self._no_media_timer.timeout.connect(self._apply_no_media)
         # Кольцо прогресса двигается по таймеру, пока трек играет.
         self._ring_timer = QTimer(self)
         self._ring_timer.setInterval(RING_TICK_MS)
@@ -548,6 +555,7 @@ class NowPlayingWidget(QWidget):
             f"{len(cover_bytes)}B" if cover_bytes else None,
             self._user_hidden,
         )
+        self._no_media_timer.stop()  # провал между треками закончился
         track_changed = (
             title != self._title or artist != self._artist or not self._has_media
         )
@@ -730,7 +738,20 @@ class NowPlayingWidget(QWidget):
             self.move(nx, ny)
 
     def set_no_media(self) -> None:
-        """Медиа нет: скрыться (по настройке) или показать заглушку."""
+        """Медиа нет: скрыться (по настройке) или показать заглушку.
+
+        Между треками плеер (браузер) на ~1 с сообщает «сессии нет». Если
+        пока играл трек, реакция откладывается на NO_MEDIA_GRACE_MS: придёт
+        новый трек — виджет даже не мигнёт.
+        """
+        if self._has_media and self.isVisible():
+            if not self._no_media_timer.isActive():
+                self._no_media_timer.start(NO_MEDIA_GRACE_MS)
+            return
+        self._apply_no_media()
+
+    def _apply_no_media(self) -> None:
+        self._no_media_timer.stop()
         logger.info(
             "UI ← no_media: hide_when_no_media=%s hidden=%s",
             self.settings.hide_when_no_media,

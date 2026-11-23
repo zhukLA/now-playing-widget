@@ -182,7 +182,7 @@ def test_mode_buttons_disabled_until_supported(widget) -> None:
     widget.set_modes(_modes(repeat="off", shuffle=False, repeat_supported=True,
                             shuffle_supported=True))
     assert widget._button_enabled("repeat") and widget._button_enabled("shuffle")
-    widget.set_no_media()
+    widget._apply_no_media()  # без паузы-«грейса» между треками
     assert not widget._button_enabled("repeat")
 
 
