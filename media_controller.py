@@ -34,6 +34,7 @@ import hashlib
 import inspect
 import logging
 import os
+import random
 import struct
 import threading
 import zlib
@@ -85,6 +86,19 @@ COMMAND_METHODS = {
 
 #: Методы получения свойств: сначала современный async-вариант winrt 3.x.
 PROPS_METHODS = ("try_get_media_properties_async", "try_get_media_properties")
+
+#: Режимы повтора в порядке переключения кнопкой (как в Apple Music):
+#: выкл → весь список → один трек → выкл.
+REPEAT_OFF = "off"
+REPEAT_ALL = "all"
+REPEAT_ONE = "one"
+REPEAT_CYCLE = (REPEAT_OFF, REPEAT_ALL, REPEAT_ONE)
+#: Windows.Media.MediaPlaybackAutoRepeatMode: NONE = 0, TRACK = 1, LIST = 2.
+_REPEAT_TO_WINRT = {REPEAT_OFF: 0, REPEAT_ONE: 1, REPEAT_ALL: 2}
+_REPEAT_FROM_WINRT = {v: k for k, v in _REPEAT_TO_WINRT.items()}
+
+REPEAT_METHOD = "try_change_auto_repeat_mode_async"
+SHUFFLE_METHOD = "try_change_shuffle_active_async"
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +197,106 @@ def session_playback_status(session: Any) -> Any:
         logger.warning("get_playback_info не удался", exc_info=True)
         return None
     return getattr(playback_info, "playback_status", None)
+
+
+@dataclass(frozen=True)
+class PlaybackModes:
+    """Повтор и перемешивание текущей сессии.
+
+    ``repeat``/``shuffle`` — None, если плеер их не сообщает;
+    ``*_supported`` — можно ли переключать режим (решает сам плеер).
+    """
+
+    repeat: Optional[str] = None
+    shuffle: Optional[bool] = None
+    repeat_supported: bool = False
+    shuffle_supported: bool = False
+
+
+def _unbox(value: Any) -> Any:
+    """IReference<T> может прийти как значение или как обёртка с ``.value``."""
+    if value is None:
+        return None
+    if isinstance(value, (bool, int)):
+        return value
+    inner = getattr(value, "value", value)
+    return inner
+
+
+def repeat_mode_from_winrt(value: Any) -> Optional[str]:
+    """MediaPlaybackAutoRepeatMode (enum/int/None) → "off" | "one" | "all" | None."""
+    value = _unbox(value)
+    if value is None:
+        return None
+    try:
+        return _REPEAT_FROM_WINRT.get(int(value))
+    except (TypeError, ValueError):
+        name = str(getattr(value, "name", "")).upper()
+        return {"NONE": REPEAT_OFF, "TRACK": REPEAT_ONE, "LIST": REPEAT_ALL}.get(name)
+
+
+def repeat_mode_to_winrt(mode: str) -> Any:
+    """"off" | "one" | "all" → значение MediaPlaybackAutoRepeatMode.
+
+    Перечисление берётся из winrt-Windows.Media (ленивый импорт); без пакета
+    — целое число (IntEnum совместим с int).
+    """
+    index = _REPEAT_TO_WINRT[mode]
+    try:
+        from winrt.windows.media import MediaPlaybackAutoRepeatMode  # noqa: PLC0415
+
+        return MediaPlaybackAutoRepeatMode(index)
+    except Exception:  # noqa: BLE001 — нет пакета/другая версия: передаём int
+        return index
+
+
+def next_repeat_mode(current: Optional[str]) -> str:
+    """Следующий режим по кругу выкл → все → один → выкл."""
+    if current not in REPEAT_CYCLE:
+        return REPEAT_ALL
+    return REPEAT_CYCLE[(REPEAT_CYCLE.index(current) + 1) % len(REPEAT_CYCLE)]
+
+
+def parse_playback_modes(playback_info: Any) -> PlaybackModes:
+    """PlaybackModes из GlobalSystemMediaTransportControlsSessionPlaybackInfo."""
+    if playback_info is None:
+        return PlaybackModes()
+    try:
+        repeat = repeat_mode_from_winrt(getattr(playback_info, "auto_repeat_mode", None))
+        shuffle_raw = _unbox(getattr(playback_info, "is_shuffle_active", None))
+        shuffle = None if shuffle_raw is None else bool(shuffle_raw)
+        controls = getattr(playback_info, "controls", None)
+    except Exception:
+        logger.warning("режимы повтора/перемешивания не прочитаны", exc_info=True)
+        return PlaybackModes()
+    if controls is not None:
+        repeat_supported = bool(getattr(controls, "is_repeat_enabled", False))
+        shuffle_supported = bool(getattr(controls, "is_shuffle_enabled", False))
+    else:
+        repeat_supported = repeat is not None
+        shuffle_supported = shuffle is not None
+    return PlaybackModes(
+        repeat=repeat,
+        shuffle=shuffle,
+        repeat_supported=repeat_supported,
+        shuffle_supported=shuffle_supported,
+    )
+
+
+async def set_repeat_mode(session: Any, mode: str) -> bool:
+    """Просит плеер сменить режим повтора. True — плеер согласился."""
+    method = getattr(session, REPEAT_METHOD, None)
+    if method is None:
+        raise AttributeError(f"у сессии нет метода {REPEAT_METHOD}")
+    return bool(await _await_if_needed(method(repeat_mode_to_winrt(mode))))
+
+
+async def set_shuffle(session: Any, active: bool) -> bool:
+    """Просит плеер включить/выключить перемешивание. True — плеер согласился."""
+    method = getattr(session, SHUFFLE_METHOD, None)
+    if method is None:
+        raise AttributeError(f"у сессии нет метода {SHUFFLE_METHOD}")
+    return bool(await _await_if_needed(method(bool(active))))
 
 
 def choose_session(current: Any, sessions: Iterable[Any]) -> Any:
@@ -306,6 +420,9 @@ class MockSession:
         self._index = int(index) % len(self._tracks)
         self._playing = bool(playing)
         self._covers: dict[int, bytes] = {}
+        self._repeat = REPEAT_OFF
+        self._shuffle = False
+        self._rng = random.Random(0)  # детерминированно — удобно в тестах
 
     @property
     def index(self) -> int:
@@ -314,6 +431,33 @@ class MockSession:
     @property
     def playing(self) -> bool:
         return self._playing
+
+    @property
+    def modes(self) -> PlaybackModes:
+        return PlaybackModes(
+            repeat=self._repeat,
+            shuffle=self._shuffle,
+            repeat_supported=True,
+            shuffle_supported=True,
+        )
+
+    def set_repeat(self, mode: str) -> None:
+        if mode not in REPEAT_CYCLE:
+            raise ValueError(f"неизвестный режим повтора: {mode}")
+        self._repeat = mode
+
+    def set_shuffle(self, active: bool) -> None:
+        self._shuffle = bool(active)
+
+    def auto_advance(self) -> None:
+        """Трек «доиграл»: повтор одного — тот же; без повтора в конце списка — стоп."""
+        if self._repeat == REPEAT_ONE:
+            return
+        last = self._index == len(self._tracks) - 1
+        if self._repeat == REPEAT_OFF and last and not self._shuffle:
+            self._playing = False
+            return
+        self.next()
 
     @property
     def track(self) -> TrackInfo:
@@ -337,6 +481,10 @@ class MockSession:
         return self._playing
 
     def next(self) -> None:
+        if self._shuffle and len(self._tracks) > 1:
+            choices = [i for i in range(len(self._tracks)) if i != self._index]
+            self._index = self._rng.choice(choices)
+            return
         self._index = (self._index + 1) % len(self._tracks)
 
     def previous(self) -> None:
@@ -404,6 +552,8 @@ class MediaController(QObject):
     playback_state_changed = Signal(bool)
     #: медиа отсутствует (нет сессии / сессия закрыта / winrt недоступен)
     no_media = Signal()
+    #: (PlaybackModes,) — повтор/перемешивание и их поддержка плеером
+    modes_changed = Signal(object)
 
     def __init__(
         self,
@@ -443,6 +593,7 @@ class MediaController(QObject):
         self._last_cover: Optional[bytes] = None
         self._last_cover_sha1: Optional[str] = None
         self._last_playing: Optional[bool] = None
+        self._last_modes: Optional[PlaybackModes] = None
 
     # -- свойства для отладки ------------------------------------------------
 
@@ -513,6 +664,15 @@ class MediaController(QObject):
     def previous(self) -> None:
         logger.info("команда: previous")
         self._submit(self._command("previous"))
+
+    def cycle_repeat(self) -> None:
+        """Повтор по кругу: выкл → весь список → один трек → выкл."""
+        logger.info("команда: repeat")
+        self._submit(self._command("repeat"))
+
+    def toggle_shuffle(self) -> None:
+        logger.info("команда: shuffle")
+        self._submit(self._command("shuffle"))
 
     # -- внутреннее: поток/цикл ---------------------------------------------
 
@@ -693,6 +853,19 @@ class MediaController(QObject):
         self._last_cover = None
         self._last_cover_sha1 = None
         self._last_playing = None
+        self._last_modes = None
+
+    def _emit_modes(self, modes: PlaybackModes) -> None:
+        if modes != self._last_modes:
+            self._last_modes = modes
+            logger.info(
+                "modes_changed: repeat=%s shuffle=%s (поддержка: %s/%s)",
+                modes.repeat,
+                modes.shuffle,
+                modes.repeat_supported,
+                modes.shuffle_supported,
+            )
+            self.modes_changed.emit(modes)
 
     def _schedule_refresh(self, *, with_cover: bool, force: bool = False) -> None:
         """Планирует refresh с дебаунсом: пачка событий в пределах
@@ -794,7 +967,11 @@ class MediaController(QObject):
         if new_track:
             self._cancel_cover_retry()
             prev_sha = self._last_cover_sha1
-            cover = await self._read_cover_if(props, enabled=with_cover)
+            # Обложку нового трека читаем ВСЕГДА, даже если refresh пришёл от
+            # playback_info_changed (with_cover=False): иначе трек уходил в UI
+            # без обложки, повторы не запускались, и заглушка оставалась
+            # до следующего media_properties_changed (которого может не быть).
+            cover = await self._read_cover_if(props, enabled=True)
             if not self._refresh_is_current(seq, session):
                 return
             # Обложка прошлого трека НЕ должна остаться: если её нет —
@@ -815,7 +992,7 @@ class MediaController(QObject):
                 and prev_sha is not None
                 and _sha1(cover) == prev_sha
             )
-            if with_cover and (cover is None or same_as_prev):
+            if cover is None or same_as_prev:
                 reason = (
                     "обложка отсутствует"
                     if cover is None
@@ -868,6 +1045,8 @@ class MediaController(QObject):
             self._last_playing = playing
             logger.info("playback_state_changed: %s", playing)
             self.playback_state_changed.emit(playing)
+        # Повтор/перемешивание приходят тем же playback_info_changed.
+        self._emit_modes(parse_playback_modes(playback_info))
 
     def _handle_session_gone(self) -> None:
         """Сессия могла закрыться: уточняем у менеджера либо переходим в no_media."""
@@ -878,7 +1057,12 @@ class MediaController(QObject):
             except Exception:
                 logger.warning("get_current_session при проверке сессии", exc_info=True)
                 current = None
-        if current is not None and current is not self._session:
+        # ВАЖНО: winrt на каждый get_current_session() отдаёт НОВУЮ
+        # Python-обёртку, поэтому проверки ``is`` недостаточно. Если менеджер
+        # вернул ту же сессию (тот же AUMID), что только что не прочиталась,
+        # переподписка на неё дала бы бесконечный цикл
+        # refresh → ошибка → _set_session → refresh … каждые REFRESH_DEBOUNCE.
+        if current is not None and not _same_session(current, self._session):
             logger.info("сессия сменилась: %s → %s", _auid(self._session), _auid(current))
             self._set_session(current)
             return
@@ -1033,8 +1217,12 @@ class MediaController(QObject):
                 mock.toggle()
             elif action == "next":
                 mock.next()
-            else:
+            elif action == "previous":
                 mock.previous()
+            elif action == "repeat":
+                mock.set_repeat(next_repeat_mode(mock.modes.repeat))
+            elif action == "shuffle":
+                mock.set_shuffle(not mock.modes.shuffle)
             logger.debug("mock-команда %s → index=%d playing=%s",
                          action, mock.index, mock.playing)
             self._emit_mock()
@@ -1043,11 +1231,41 @@ class MediaController(QObject):
         if session is None:
             logger.warning("команда %s: сессии нет", action)
             return
+        if action in ("repeat", "shuffle"):
+            await self._mode_command(session, action)
+            return
         try:
             await invoke_command(session, action)
             logger.info("команда %s выполнена (%s)", action, COMMAND_METHODS[action])
         except Exception:
             logger.exception("команда %s не выполнена", action)
+
+    async def _mode_command(self, session: Any, action: str) -> None:
+        """Повтор/перемешивание: новое значение считается от текущего."""
+        modes = self._last_modes or PlaybackModes()
+        try:
+            if action == "repeat":
+                if not modes.repeat_supported:
+                    logger.info("плеер не поддерживает повтор — команда пропущена")
+                    return
+                target = next_repeat_mode(modes.repeat)
+                ok = await set_repeat_mode(session, target)
+                logger.info("повтор → %s: %s", target, "принято" if ok else "отклонено плеером")
+            else:
+                if not modes.shuffle_supported:
+                    logger.info("плеер не поддерживает перемешивание — команда пропущена")
+                    return
+                target = not bool(modes.shuffle)
+                ok = await set_shuffle(session, target)
+                logger.info(
+                    "перемешивание → %s: %s", target, "принято" if ok else "отклонено плеером"
+                )
+        except Exception:
+            logger.exception("команда %s не выполнена", action)
+            return
+        # Не все плееры шлют playback_info_changed после смены режима —
+        # перечитываем состояние сами, чтобы кнопка показала правду.
+        self._schedule_refresh(with_cover=False)
 
     # -- MOCK ----------------------------------------------------------------
 
@@ -1059,7 +1277,7 @@ class MediaController(QObject):
             if mock is None:
                 return
             if mock.playing:
-                mock.next()
+                mock.auto_advance()
             self._emit_mock()
 
     def _emit_mock(self) -> None:
@@ -1081,6 +1299,7 @@ class MediaController(QObject):
         if mock.playing != self._last_playing:
             self._last_playing = mock.playing
             self.playback_state_changed.emit(mock.playing)
+        self._emit_modes(mock.modes)
 
     # -- очистка -------------------------------------------------------------
 
@@ -1115,7 +1334,7 @@ class MediaController(QObject):
         """Однократная отписка от событий менеджера по сохранённому токену."""
         manager, self._manager = self._manager, None
         token, self._current_token = self._current_token, None
-        handler, self._current_handler = self._current_handler, None
+        self._current_handler = None
         if manager is None or token is None:
             return
         try:
@@ -1134,3 +1353,13 @@ def _auid(session: Any) -> Optional[str]:
     except Exception:
         logger.debug("source_app_user_model_id недоступен", exc_info=True)
         return None
+
+
+def _same_session(a: Any, b: Any) -> bool:
+    """Одна и та же SMTC-сессия: тот же объект или тот же непустой AUMID."""
+    if a is b:
+        return True
+    if a is None or b is None:
+        return False
+    aumid = _auid(a)
+    return bool(aumid) and aumid == _auid(b)
