@@ -75,6 +75,8 @@ def test_to_dict_shape() -> None:
         "autostart_enabled",
         "x",
         "y",
+        "scale",
+        "mini",
     }
     json.dumps(d)  # должен быть сериализуем
 

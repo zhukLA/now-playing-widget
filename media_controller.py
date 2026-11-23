@@ -38,7 +38,9 @@ import random
 import struct
 import threading
 import zlib
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 from PySide6.QtCore import QObject, QThread, Signal
@@ -74,6 +76,9 @@ REFRESH_DEBOUNCE = 0.15  # сек
 
 #: Период смены трека в MOCK-режиме, сек.
 MOCK_INTERVAL = 6.0
+#: Как часто перечитывать позицию трека у плеера, сек (между опросами
+#: виджет сам двигает кольцо прогресса по своим часам).
+TIMELINE_POLL = 2.0
 
 _MOCK_OFF_VALUES = ("", "0", "false", "no", "off")
 
@@ -299,6 +304,51 @@ async def set_shuffle(session: Any, active: bool) -> bool:
     return bool(await _await_if_needed(method(bool(active))))
 
 
+def _seconds(value: Any) -> float:
+    """timedelta / WinRT TimeSpan → секунды (0.0, если прочитать нельзя)."""
+    if value is None:
+        return 0.0
+    try:
+        return float(value.total_seconds())
+    except AttributeError:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+
+def parse_timeline(
+    props: Any, playing: bool, now: Optional[datetime] = None
+) -> tuple[float, float]:
+    """(позиция, длительность) в секундах из TimelineProperties.
+
+    Позиция в SMTC — на момент ``last_updated_time``; пока трек играет,
+    добавляем прошедшее с тех пор время. Длительность 0.0 — неизвестна
+    (стримы, плеер не сообщает).
+    """
+    if props is None:
+        return 0.0, 0.0
+    try:
+        start = _seconds(getattr(props, "start_time", None))
+        end = _seconds(getattr(props, "end_time", None))
+        position = _seconds(getattr(props, "position", None)) - start
+        duration = end - start
+        updated = getattr(props, "last_updated_time", None)
+    except Exception:
+        logger.warning("тайминг трека не прочитан", exc_info=True)
+        return 0.0, 0.0
+    if duration <= 0.5:
+        return 0.0, 0.0
+    if playing and isinstance(updated, datetime) and updated.year > 2000:
+        current = now or datetime.now(timezone.utc)
+        if updated.tzinfo is None:
+            current = current.replace(tzinfo=None)
+        elapsed = (current - updated).total_seconds()
+        if 0.0 <= elapsed < 6 * 3600:
+            position += elapsed
+    return max(0.0, min(duration, position)), duration
+
+
 def choose_session(current: Any, sessions: Iterable[Any]) -> Any:
     """Выбор сессии для отображения.
 
@@ -423,6 +473,23 @@ class MockSession:
         self._repeat = REPEAT_OFF
         self._shuffle = False
         self._rng = random.Random(0)  # детерминированно — удобно в тестах
+        # Позиция трека: накопленное + время с последнего запуска.
+        self._pos_base = 0.0
+        self._pos_since: Optional[float] = time.monotonic() if self._playing else None
+
+    @property
+    def duration(self) -> float:
+        """Длительность mock-трека = период смены, чтобы кольцо «замыкалось»."""
+        return MOCK_INTERVAL
+
+    @property
+    def position(self) -> float:
+        extra = 0.0 if self._pos_since is None else time.monotonic() - self._pos_since
+        return min(self.duration, self._pos_base + extra)
+
+    def _restart_position(self) -> None:
+        self._pos_base = 0.0
+        self._pos_since = time.monotonic() if self._playing else None
 
     @property
     def index(self) -> int:
@@ -452,10 +519,13 @@ class MockSession:
     def auto_advance(self) -> None:
         """Трек «доиграл»: повтор одного — тот же; без повтора в конце списка — стоп."""
         if self._repeat == REPEAT_ONE:
+            self._restart_position()
             return
         last = self._index == len(self._tracks) - 1
         if self._repeat == REPEAT_OFF and last and not self._shuffle:
             self._playing = False
+            self._pos_base = self.duration
+            self._pos_since = None
             return
         self.next()
 
@@ -477,10 +547,17 @@ class MockSession:
         return cached
 
     def toggle(self) -> bool:
+        now = time.monotonic()
+        if self._playing and self._pos_since is not None:
+            self._pos_base = min(self.duration, self._pos_base + now - self._pos_since)
+            self._pos_since = None
+        elif not self._playing:
+            self._pos_since = now
         self._playing = not self._playing
         return self._playing
 
     def next(self) -> None:
+        self._restart_position()
         if self._shuffle and len(self._tracks) > 1:
             choices = [i for i in range(len(self._tracks)) if i != self._index]
             self._index = self._rng.choice(choices)
@@ -488,6 +565,7 @@ class MockSession:
         self._index = (self._index + 1) % len(self._tracks)
 
     def previous(self) -> None:
+        self._restart_position()
         self._index = (self._index - 1) % len(self._tracks)
 
 
@@ -554,6 +632,8 @@ class MediaController(QObject):
     no_media = Signal()
     #: (PlaybackModes,) — повтор/перемешивание и их поддержка плеером
     modes_changed = Signal(object)
+    #: (позиция, длительность) в секундах; длительность 0 — неизвестна
+    timeline_changed = Signal(float, float)
 
     def __init__(
         self,
@@ -588,6 +668,8 @@ class MediaController(QObject):
 
         # Фоновые повторные попытки чтения обложки после смены трека.
         self._cover_retry_task: Optional[asyncio.Task] = None
+        # Периодический опрос позиции трека.
+        self._timeline_task: Optional[asyncio.Task] = None
 
         self._last_key: Optional[tuple[str, str]] = None
         self._last_cover: Optional[bytes] = None
@@ -711,7 +793,28 @@ class MediaController(QObject):
         if self._mock:
             self._mock_task = asyncio.ensure_future(self._mock_loop())
         else:
+            self._timeline_task = asyncio.ensure_future(self._timeline_loop())
             await self._init_smtc()
+
+    def _emit_timeline(self) -> None:
+        """Читает позицию/длительность у текущей сессии и отдаёт в UI."""
+        session = self._session
+        if session is None:
+            return
+        try:
+            props = session.get_timeline_properties()
+            playing = bool(self._last_playing)
+        except Exception:
+            logger.debug("get_timeline_properties не удался", exc_info=True)
+            return
+        position, duration = parse_timeline(props, playing)
+        self.timeline_changed.emit(position, duration)
+
+    async def _timeline_loop(self) -> None:
+        while True:
+            await asyncio.sleep(TIMELINE_POLL)
+            if self._session is not None and self._last_playing:
+                self._emit_timeline()
 
     async def _init_smtc(self) -> None:
         try:
@@ -1047,6 +1150,8 @@ class MediaController(QObject):
             self.playback_state_changed.emit(playing)
         # Повтор/перемешивание приходят тем же playback_info_changed.
         self._emit_modes(parse_playback_modes(playback_info))
+        # Позиция: после любого refresh (смена трека, пауза, перемотка).
+        self._emit_timeline()
 
     def _handle_session_gone(self) -> None:
         """Сессия могла закрыться: уточняем у менеджера либо переходим в no_media."""
@@ -1300,6 +1405,7 @@ class MediaController(QObject):
             self._last_playing = mock.playing
             self.playback_state_changed.emit(mock.playing)
         self._emit_modes(mock.modes)
+        self.timeline_changed.emit(mock.position, mock.duration)
 
     # -- очистка -------------------------------------------------------------
 
@@ -1313,7 +1419,12 @@ class MediaController(QObject):
             self._mock_task = None
         tasks = [
             t
-            for t in (self._refresh_task, self._debounce_task, self._cover_retry_task)
+            for t in (
+                self._refresh_task,
+                self._debounce_task,
+                self._cover_retry_task,
+                self._timeline_task,
+            )
             if t is not None
         ]
         for task in tasks:
@@ -1323,6 +1434,7 @@ class MediaController(QObject):
         self._refresh_task = None
         self._debounce_task = None
         self._cover_retry_task = None
+        self._timeline_task = None
         self._pending_cover = False
         self._pending_force = False
         if not self._mock:

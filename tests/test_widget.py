@@ -78,7 +78,8 @@ def test_text_area_uses_card_width(widget) -> None:
     """Текст занимает всё место справа от обложки (раньше ~137 px из 360)."""
     text = widget._text_rect()
     card = widget._card_rect()
-    assert text.right() >= card.right() - 20
+    # Справа оставлено место под крестик «закрыть».
+    assert text.right() >= card.right() - 40
     assert text.width() > 200
 
 

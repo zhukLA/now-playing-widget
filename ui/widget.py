@@ -57,7 +57,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QMenu, QWidget
 
-from settings import Settings
+from audio_volume import MasterVolume
+from settings import MIN_SCALE, Settings
 from ui.anim import (
     Tween,
     ease_in_out_cubic,
@@ -70,13 +71,34 @@ logger = logging.getLogger("npw.ui")
 
 # Геометрия (окно ~360×110 + поле под тень).
 SHADOW_MARGIN = 6
-WINDOW_SIZE = QSize(372, 122)  # карточка 360×110
+WINDOW_SIZE = QSize(372, 122)  # карточка 360×110 (максимальный размер)
+#: Мини-режим: карточка 134×44 — только prev / play / next и крестик.
+MINI_SIZE = QSize(146, 56)
+#: Мини-режим включается, когда окно тянут уже меньше этой доли максимума.
+MINI_SWITCH_SCALE = 0.5
 CARD_RADIUS = 14.0
-COVER_MARGIN = 10
-COVER_SIZE = 90
+COVER_MARGIN = 14
+COVER_SIZE = 82
 COVER_RADIUS = 10.0
-TEXT_LEFT = 112  # от левого края карточки
-TEXT_RIGHT_MARGIN = 14  # отступ текста от правого края карточки
+TEXT_LEFT = 116  # от левого края карточки
+TEXT_RIGHT_MARGIN = 28  # отступ текста от правого края (там крестик)
+
+# Кольцо прогресса вокруг обложки.
+RING_MARGIN = 8  # от края карточки до кольца
+RING_SIZE = 94
+RING_WIDTH = 2.5
+RING_RADIUS = 16.0
+RING_TRACK = QColor(255, 255, 255, 38)
+RING_FILL = QColor(255, 255, 255, 225)
+RING_TICK_MS = 200  # частота перерисовки кольца
+
+# Крестик «закрыть» и громкость.
+CLOSE_SIZE = 17
+VOLUME_ICON_SIZE = 22
+VOLUME_POPUP_W = 26
+VOLUME_POPUP_H = 62
+VOLUME_STEP = 0.05
+GRIP_SIZE = 14  # угол для изменения размера (правый нижний)
 BUTTON_SIZE = 26
 BUTTON_GAP = 8
 #: Второстепенные кнопки (перемешивание, повтор) — меньше и без подложки.
@@ -118,8 +140,21 @@ MARQUEE_FADE = 18  # ширина растворения текста у кра�
 MARQUEE_FRAME_MS = 16  # ~60 кадров/с
 
 BUTTON_NAMES = ("shuffle", "prev", "play_pause", "next", "repeat")
+#: Кнопки, которые есть в мини-режиме.
+MINI_BUTTONS = ("prev", "play_pause", "next")
+#: Остальные «цели» мыши: крестик и значок громкости (не в _button_rects).
+EXTRA_NAMES = ("close", "volume")
+ALL_NAMES = BUTTON_NAMES + EXTRA_NAMES
 
 REPEAT_LABELS = {"off": "выкл", "all": "все треки", "one": "один трек"}
+
+#: Размеры из контекстного меню: (название, масштаб, мини-режим).
+SIZE_PRESETS = (
+    ("Максимальный", 1.0, False),
+    ("Средний", 0.8, False),
+    ("Маленький", MIN_SCALE, False),
+    ("Мини (только кнопки)", 1.0, True),
+)
 
 
 def _elide(text: str, font: QFont, width: int) -> str:
@@ -276,6 +311,65 @@ def _line_glyph(glyph: str) -> QPainterPath:
     return path
 
 
+def volume_glyph(level: float, muted: bool) -> QPainterPath:
+    """Динамик (speaker.wave) с центром в (0, 0): 0–2 «волны» по уровню."""
+    path = QPainterPath()
+    path.setFillRule(Qt.FillRule.WindingFill)
+    body = _rounded_polygon(
+        [(-6.0, -2.2), (-3.2, -2.2), (0.8, -5.6), (0.8, 5.6), (-3.2, 2.2), (-6.0, 2.2)], 1.0
+    )
+    path.addPath(body)
+    waves = QPainterPath()
+    if muted or level <= 0.001:
+        # Крестик вместо волн.
+        waves.moveTo(3.4, -2.6)
+        waves.lineTo(7.4, 2.6)
+        waves.moveTo(7.4, -2.6)
+        waves.lineTo(3.4, 2.6)
+    else:
+        count = 1 if level < 0.5 else 2
+        for i in range(count):
+            r = 3.4 + 3.2 * i
+            waves.arcMoveTo(QRectF(1.2 - r, -r, 2 * r, 2 * r), 40.0)
+            waves.arcTo(QRectF(1.2 - r, -r, 2 * r, 2 * r), 40.0, -80.0)
+    path.addPath(_stroked(waves, 1.3))
+    path.translate(-0.5, 0.0)
+    return path
+
+
+def close_glyph() -> QPainterPath:
+    line = QPainterPath()
+    d = 3.2
+    line.moveTo(-d, -d)
+    line.lineTo(d, d)
+    line.moveTo(d, -d)
+    line.lineTo(-d, d)
+    return _stroked(line, 1.5)
+
+
+def ring_path(rect: QRectF, radius: float) -> QPainterPath:
+    """Контур скруглённого прямоугольника: старт сверху по центру, по часовой."""
+    r = min(radius, rect.width() / 2, rect.height() / 2)
+    cx = rect.center().x()
+    path = QPainterPath()
+    path.moveTo(cx, rect.top())
+    path.lineTo(rect.right() - r, rect.top())
+    path.arcTo(QRectF(rect.right() - 2 * r, rect.top(), 2 * r, 2 * r), 90.0, -90.0)
+    path.lineTo(rect.right(), rect.bottom() - r)
+    path.arcTo(QRectF(rect.right() - 2 * r, rect.bottom() - 2 * r, 2 * r, 2 * r), 0.0, -90.0)
+    path.lineTo(rect.left() + r, rect.bottom())
+    path.arcTo(QRectF(rect.left(), rect.bottom() - 2 * r, 2 * r, 2 * r), 270.0, -90.0)
+    path.lineTo(rect.left(), rect.top() + r)
+    path.arcTo(QRectF(rect.left(), rect.top(), 2 * r, 2 * r), 180.0, -90.0)
+    path.lineTo(cx, rect.top())
+    return path
+
+
+def format_time(seconds: float) -> str:
+    total = max(0, int(seconds))
+    return f"{total // 60}:{total % 60:02d}"
+
+
 @dataclass(frozen=True)
 class _Frame:
     """Снимок отображаемого содержимого — «старый» слой при переходе."""
@@ -298,6 +392,8 @@ class NowPlayingWidget(QWidget):
     settings_requested = Signal()
     quit_requested = Signal()
     position_changed = Signal(int, int)
+    #: (масштаб, мини-режим) — пользователь изменил размер окна
+    scale_changed = Signal(float, bool)
 
     def __init__(
         self,
@@ -305,9 +401,26 @@ class NowPlayingWidget(QWidget):
         parent: Optional[QWidget] = None,
         *,
         animations: Optional[bool] = None,
+        volume: Optional[MasterVolume] = None,
     ) -> None:
         super().__init__(parent)
         self.settings = settings
+        self._volume_backend = volume if volume is not None else MasterVolume()
+        self._volume_level = 0.5
+        self._volume_muted = False
+        self._volume_dragging = False
+        self._volume_wanted = False
+        self._scale =min(1.0, max(MIN_SCALE, float(getattr(settings, "scale", 1.0))))
+        self._mini = bool(getattr(settings, "mini", False))
+        self._resizing = False
+        self._resize_start_global = QPoint()
+        self._resize_start_width = 0
+        self._bg_size = QSize()
+        # Позиция трека (для кольца прогресса): значение на момент _tl_clock.
+        self._tl_position = 0.0
+        self._tl_duration = 0.0
+        self._tl_clock = QElapsedTimer()
+        self._tl_clock.start()
         self._animations = (
             system_animations_enabled() if animations is None else bool(animations)
         )
@@ -318,7 +431,7 @@ class NowPlayingWidget(QWidget):
         self.setWindowFlag(Qt.WindowType.Tool, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
-        self.resize(WINDOW_SIZE)
+        self._apply_size()
 
         # Данные трека
         self._title = ""
@@ -356,8 +469,16 @@ class NowPlayingWidget(QWidget):
         self._prev: Optional[_Frame] = None
         self._xfade = Tween(1.0, repaint, enabled=enabled, parent=self)
         self._buttons = Tween(0.0, repaint, enabled=enabled, parent=self)
-        self._hover = {n: Tween(0.0, repaint, enabled=enabled, parent=self) for n in BUTTON_NAMES}
-        self._press = {n: Tween(0.0, repaint, enabled=enabled, parent=self) for n in BUTTON_NAMES}
+        self._hover = {n: Tween(0.0, repaint, enabled=enabled, parent=self) for n in ALL_NAMES}
+        self._press = {n: Tween(0.0, repaint, enabled=enabled, parent=self) for n in ALL_NAMES}
+        # Всплывающий вертикальный ползунок громкости и «ручка» изменения размера.
+        self._volume_open = Tween(0.0, repaint, enabled=enabled, parent=self)
+        self._grip_hover = Tween(0.0, repaint, enabled=enabled, parent=self)
+        self._grip_active = False
+        # Кольцо прогресса двигается по таймеру, пока трек играет.
+        self._ring_timer = QTimer(self)
+        self._ring_timer.setInterval(RING_TICK_MS)
+        self._ring_timer.timeout.connect(self._ring_tick)
         # 0 — значок play, 1 — pause.
         self._play_morph = Tween(0.0, repaint, enabled=enabled, parent=self)
         # Повтор/перемешивание: что сообщает плеер и плавная индикация.
@@ -404,6 +525,9 @@ class NowPlayingWidget(QWidget):
         а изменение «прятать без медиа» должно сработать сразу.
         """
         self.settings = settings
+        self.set_display_mode(
+            getattr(settings, "scale", 1.0), getattr(settings, "mini", False), notify=False
+        )
         on_top = bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
         if on_top != settings.always_on_top:
             was_shown = self._target_visible
@@ -441,6 +565,8 @@ class NowPlayingWidget(QWidget):
             self._apply_cover(None)
         if track_changed:
             self._restart_marquee()
+            # Новый трек — кольцо с нуля; настоящая позиция придёт из плеера.
+            self.set_timeline(0.0, 0.0)
         self._apply_visibility()
         self.update()
 
@@ -459,7 +585,11 @@ class NowPlayingWidget(QWidget):
 
     def set_playing(self, is_playing: bool) -> None:
         logger.debug("UI ← playback_state_changed: %s", is_playing)
+        # На паузе кольцо замирает там, где остановился трек.
+        self._tl_position = self.progress_position()
+        self._tl_clock.restart()
         self._is_playing = bool(is_playing)
+        self._sync_ring_timer()
         self._play_morph.to(
             1.0 if self._is_playing else 0.0, PLAY_MORPH_MS, ease_in_out_cubic
         )
@@ -487,6 +617,118 @@ class NowPlayingWidget(QWidget):
         self._update_tooltip()
         self.update()
 
+    # -- прогресс трека ------------------------------------------------------
+
+    def set_timeline(self, position: float, duration: float) -> None:
+        """Позиция и длительность трека в секундах (0 — длительность неизвестна)."""
+        self._tl_duration = max(0.0, float(duration))
+        self._tl_position = max(0.0, float(position))
+        self._tl_clock.restart()
+        self._sync_ring_timer()
+        self.update(self._ring_update_rect())
+
+    def progress_position(self) -> float:
+        """Текущая позиция с учётом времени, прошедшего с последнего обновления."""
+        position = self._tl_position
+        if self._is_playing and self._tl_duration > 0:
+            position += self._tl_clock.elapsed() / 1000.0
+        if self._tl_duration > 0:
+            position = min(position, self._tl_duration)
+        return max(0.0, position)
+
+    def progress_fraction(self) -> float:
+        if self._tl_duration <= 0:
+            return 0.0
+        return min(1.0, self.progress_position() / self._tl_duration)
+
+    def _sync_ring_timer(self) -> None:
+        want = (
+            self._is_playing
+            and self._tl_duration > 0
+            and self._has_media
+            and not self._mini
+            and self.isVisible()
+        )
+        if want and not self._ring_timer.isActive():
+            self._ring_timer.start()
+        elif not want and self._ring_timer.isActive():
+            self._ring_timer.stop()
+
+    def _ring_tick(self) -> None:
+        if not (self.isVisible() and self._is_playing and self._tl_duration > 0):
+            self._ring_timer.stop()
+            return
+        self.update(self._ring_update_rect())
+
+    def _ring_update_rect(self) -> QRect:
+        return self._to_device(self._ring_rect().adjusted(-4, -4, 4, 4).toAlignedRect())
+
+    # -- размер окна ---------------------------------------------------------
+
+    @property
+    def scale(self) -> float:
+        return self._scale
+
+    @property
+    def mini(self) -> bool:
+        return self._mini
+
+    def _effective_scale(self) -> float:
+        return 1.0 if self._mini else self._scale
+
+    def _logical_size(self) -> QSize:
+        return MINI_SIZE if self._mini else WINDOW_SIZE
+
+    def _apply_size(self) -> None:
+        s = self._effective_scale()
+        size = self._logical_size()
+        self.resize(round(size.width() * s), round(size.height() * s))
+
+    def _to_device(self, rect: QRect) -> QRect:
+        """Логический прямоугольник → координаты окна (с учётом масштаба)."""
+        s = self._effective_scale()
+        return QRect(
+            math.floor(rect.x() * s) - 1,
+            math.floor(rect.y() * s) - 1,
+            math.ceil(rect.width() * s) + 3,
+            math.ceil(rect.height() * s) + 3,
+        )
+
+    def _to_logical(self, point: QPointF | QPoint) -> QPoint:
+        s = self._effective_scale()
+        return QPoint(round(point.x() / s), round(point.y() / s))
+
+    def set_display_mode(
+        self, scale: float, mini: bool, *, notify: bool = True, clamp: bool = True
+    ) -> None:
+        """Размер: ``scale`` от MIN_SCALE до 1.0 (максимум) или мини-режим."""
+        scale = min(1.0, max(MIN_SCALE, float(scale)))
+        mini = bool(mini)
+        if scale == self._scale and mini == self._mini:
+            return
+        self._scale = scale
+        self._mini = mini
+        self._apply_size()
+        if clamp:
+            self._clamp_to_screen()
+        self._set_volume_open(False)
+        self._sync_ring_timer()
+        self._restart_marquee()
+        self.update()
+        if notify:
+            self.scale_changed.emit(self._scale, self._mini)
+
+    def _clamp_to_screen(self) -> None:
+        """После смены размера не даём окну уехать за край экрана."""
+        screen = QGuiApplication.screenAt(self.geometry().center()) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        nx = min(max(self.x(), area.left()), max(area.left(), area.right() - self.width() + 1))
+        ny = min(max(self.y(), area.top()), max(area.top(), area.bottom() - self.height() + 1))
+        if (nx, ny) != (self.x(), self.y()):
+            self.move(nx, ny)
+
     def set_no_media(self) -> None:
         """Медиа нет: скрыться (по настройке) или показать заглушку."""
         logger.info(
@@ -502,6 +744,7 @@ class NowPlayingWidget(QWidget):
         self._apply_cover(None)
         self.set_playing(False)
         self.set_modes(None)  # нет плеера — нет и режимов
+        self.set_timeline(0.0, 0.0)
         self._restart_marquee()
         self._apply_visibility()
         self.update()
@@ -635,19 +878,76 @@ class NowPlayingWidget(QWidget):
             Qt.AspectRatioMode.KeepAspectRatioByExpanding,
             Qt.TransformationMode.SmoothTransformation,
         )
-        self._background = blur_pixmap(pixmap, self.size())
+        self._background = blur_pixmap(pixmap, self._logical_size())
+        self._bg_size = self._logical_size()
 
     # ------------------------------------------------------------------
-    # Геометрия
+    # Геометрия (всё в логических координатах; при рисовании и обработке
+    # мыши применяется масштаб окна)
     # ------------------------------------------------------------------
 
     def _card_rect(self) -> QRect:
+        size = self._logical_size()
         return QRect(
             SHADOW_MARGIN,
             SHADOW_MARGIN,
-            self.width() - 2 * SHADOW_MARGIN,
-            self.height() - 2 * SHADOW_MARGIN,
+            size.width() - 2 * SHADOW_MARGIN,
+            size.height() - 2 * SHADOW_MARGIN,
         )
+
+    def _ring_rect(self) -> QRectF:
+        card = self._card_rect()
+        return QRectF(
+            card.left() + RING_MARGIN,
+            card.top() + (card.height() - RING_SIZE) / 2.0,
+            RING_SIZE,
+            RING_SIZE,
+        )
+
+    def _close_rect(self) -> QRect:
+        card = self._card_rect()
+        if self._mini:
+            return QRect(
+                card.right() - 8 - CLOSE_SIZE,
+                card.center().y() - CLOSE_SIZE // 2,
+                CLOSE_SIZE,
+                CLOSE_SIZE,
+            )
+        return QRect(card.right() - 8 - CLOSE_SIZE, card.top() + 7, CLOSE_SIZE, CLOSE_SIZE)
+
+    def _volume_icon_rect(self) -> QRect:
+        """Значок громкости — внизу, под текстом, по левому краю текста."""
+        card = self._card_rect()
+        center_y = card.bottom() - 12 - BUTTON_SIZE // 2
+        return QRect(
+            card.left() + TEXT_LEFT - 3,
+            center_y - VOLUME_ICON_SIZE // 2,
+            VOLUME_ICON_SIZE,
+            VOLUME_ICON_SIZE,
+        )
+
+    def _volume_popup_rect(self) -> QRect:
+        icon = self._volume_icon_rect()
+        return QRect(
+            icon.center().x() - VOLUME_POPUP_W // 2,
+            icon.top() - 4 - VOLUME_POPUP_H,
+            VOLUME_POPUP_W,
+            VOLUME_POPUP_H,
+        )
+
+    def _volume_track_rect(self) -> QRectF:
+        pop = self._volume_popup_rect()
+        return QRectF(pop.center().x() - 1.5, pop.top() + 10, 3.0, pop.height() - 20)
+
+    def _grip_rect(self) -> QRect:
+        card = self._card_rect()
+        return QRect(card.right() - GRIP_SIZE + 1, card.bottom() - GRIP_SIZE + 1, GRIP_SIZE, GRIP_SIZE)
+
+    def _extra_rects(self) -> dict[str, QRect]:
+        rects = {"close": self._close_rect()}
+        if not self._mini:
+            rects["volume"] = self._volume_icon_rect()
+        return rects
 
     def _cover_rect(self) -> QRect:
         card = self._card_rect()
@@ -683,6 +983,15 @@ class NowPlayingWidget(QWidget):
     def _button_rects(self) -> dict[str, QRect]:
         """Ряд кнопок справа внизу: ⤮  ⏪ ▶ ⏩  🔁 (как в Apple Music)."""
         card = self._card_rect()
+        if self._mini:
+            # Мини: три кнопки по центру-слева, справа место под крестик.
+            top = card.center().y() - BUTTON_SIZE // 2
+            x = card.left() + 12
+            mini: dict[str, QRect] = {}
+            for name in MINI_BUTTONS:
+                mini[name] = QRect(x, top, BUTTON_SIZE, BUTTON_SIZE)
+                x += BUTTON_SIZE + BUTTON_GAP
+            return mini
         top = card.bottom() - 12 - BUTTON_SIZE
         center_y = top + BUTTON_SIZE // 2
         secondary_top = center_y - SECONDARY_SIZE // 2
@@ -699,6 +1008,8 @@ class NowPlayingWidget(QWidget):
         return {name: rects[name] for name in BUTTON_NAMES}
 
     def _button_enabled(self, name: str) -> bool:
+        if name in EXTRA_NAMES:
+            return True  # закрыть и громкость работают и без медиа
         if not self._has_media:
             return False
         if name == "shuffle":
@@ -708,6 +1019,14 @@ class NowPlayingWidget(QWidget):
         return True
 
     def _button_tooltip(self, name: str) -> str:
+        if name == "close":
+            return "Закрыть виджет"
+        if name == "volume":
+            if not self._volume_backend.available:
+                return "Громкость недоступна"
+            if self._volume_muted:
+                return "Включить звук"
+            return f"Громкость: {round(self._volume_level * 100)}% (клик — без звука)"
         if name == "shuffle":
             if not self._shuffle_supported:
                 return "Перемешивание — плеер не поддерживает"
@@ -722,10 +1041,15 @@ class NowPlayingWidget(QWidget):
 
     def _update_tooltip(self) -> None:
         name = self._hover_button
-        self.setToolTip(self._button_tooltip(name) if name and self._has_media else "")
+        show = name is not None and (self._has_media or name in EXTRA_NAMES)
+        self.setToolTip(self._button_tooltip(name) if show else "")
 
     def _button_at(self, pos: QPoint) -> Optional[str]:
+        """Цель под курсором; ``pos`` — в логических координатах."""
         for name, rect in self._button_rects().items():
+            if rect.contains(pos):
+                return name
+        for name, rect in self._extra_rects().items():
             if rect.contains(pos):
                 return name
         return None
@@ -754,6 +1078,9 @@ class NowPlayingWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        s = self._effective_scale()
+        if s != 1.0:
+            painter.scale(s, s)
 
         card = self._card_rect()
         radius = CARD_RADIUS
@@ -786,11 +1113,130 @@ class NowPlayingWidget(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(card, radius, radius)
 
-            self._draw_cover(painter, prev, t)
-            self._draw_texts(painter, prev, t)
+            if not self._mini:
+                self._draw_ring(painter)
+                self._draw_cover(painter, prev, t)
+                self._draw_texts(painter, prev, t)
             self._draw_buttons(painter)
+            if not self._mini:
+                self._draw_volume(painter)
+            self._draw_close(painter)
+            self._draw_grip(painter)
         finally:
             painter.restore()
+
+    # -- кольцо прогресса ----------------------------------------------------
+
+    def _draw_ring(self, painter: QPainter) -> None:
+        """Прогресс трека: кольцо вокруг обложки, старт сверху, по часовой."""
+        rect = self._ring_rect().adjusted(
+            RING_WIDTH / 2, RING_WIDTH / 2, -RING_WIDTH / 2, -RING_WIDTH / 2
+        )
+        path = ring_path(rect, RING_RADIUS - RING_WIDTH / 2)
+        total = path.length()
+        if total <= 1.0:
+            return
+        painter.save()
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        track = QPen(RING_TRACK, RING_WIDTH)
+        track.setCapStyle(Qt.PenCapStyle.FlatCap)
+        painter.setPen(track)
+        painter.drawPath(path)
+
+        fraction = self.progress_fraction() if self._has_media else 0.0
+        length = total * fraction
+        if length >= 0.5:
+            pen = QPen(RING_FILL, RING_WIDTH)
+            pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+            # Штрих длиной «прогресс» и пропуск до конца контура (в единицах ширины).
+            pen.setDashPattern([length / RING_WIDTH, (total + 10.0) / RING_WIDTH])
+            painter.setPen(pen)
+            painter.drawPath(path)
+            # «Головка» на конце дуги.
+            head = path.pointAtPercent(path.percentAtLength(length))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, 255))
+            painter.drawEllipse(head, RING_WIDTH * 0.95, RING_WIDTH * 0.95)
+        painter.restore()
+
+    # -- крестик, громкость, ручка размера -----------------------------------
+
+    def _draw_close(self, painter: QPainter) -> None:
+        rect = QRectF(self._close_rect())
+        hover = self._hover["close"].value
+        press = self._press["close"].value
+        # Всегда чуть виден (полупрозрачный), ярче при наведении на окно/значок.
+        alpha = 0.32 + 0.28 * self._buttons.value + 0.40 * hover
+        painter.save()
+        center = rect.center()
+        scale = 1.0 - BUTTON_PRESS_SCALE * press
+        painter.translate(center)
+        painter.scale(scale, scale)
+        painter.setPen(Qt.PenStyle.NoPen)
+        if hover > 0.01:
+            painter.setBrush(QColor(255, 255, 255, int(60 * hover)))
+            painter.drawEllipse(QPointF(0, 0), rect.width() / 2, rect.height() / 2)
+        painter.fillPath(close_glyph(), QColor(255, 255, 255, int(255 * min(1.0, alpha))))
+        painter.restore()
+
+    def _volume_value(self) -> float:
+        return 0.0 if self._volume_muted else self._volume_level
+
+    def _draw_volume(self, painter: QPainter) -> None:
+        alpha = self._buttons.value
+        popup = self._volume_open.value
+        if alpha <= 0.001 and popup <= 0.001:
+            return
+        icon = QRectF(self._volume_icon_rect())
+        hover = max(self._hover["volume"].value, popup)
+        brightness = 0.5 + 0.5 * hover
+        painter.save()
+        painter.translate(0.0, 3.0 * (1.0 - alpha))
+        glyph_alpha = 255.0 * brightness * max(alpha, popup)
+        if glyph_alpha > 0.5:
+            painter.fillPath(
+                volume_glyph(self._volume_level, self._volume_muted).translated(icon.center()),
+                QColor(255, 255, 255, int(min(255.0, glyph_alpha))),
+            )
+        painter.restore()
+
+        if popup <= 0.001:
+            return
+        # Вертикальный ползунок: «таблетка» над значком.
+        pop = QRectF(self._volume_popup_rect())
+        painter.save()
+        painter.setOpacity(popup)
+        painter.translate(0.0, 4.0 * (1.0 - popup))
+        painter.setPen(QPen(QColor(255, 255, 255, 30), 1))
+        painter.setBrush(QColor(18, 20, 26, 225))
+        painter.drawRoundedRect(pop, pop.width() / 2, pop.width() / 2)
+
+        track = self._volume_track_rect()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 55))
+        painter.drawRoundedRect(track, 1.5, 1.5)
+        level = max(0.0, min(1.0, self._volume_value()))
+        fill_h = track.height() * level
+        fill = QRectF(track.left(), track.bottom() - fill_h, track.width(), fill_h)
+        painter.setBrush(QColor(255, 255, 255, 235))
+        painter.drawRoundedRect(fill, 1.5, 1.5)
+        painter.drawEllipse(QPointF(track.center().x(), track.bottom() - fill_h), 4.5, 4.5)
+        painter.restore()
+
+    def _draw_grip(self, painter: QPainter) -> None:
+        """Три косые чёрточки в правом нижнем углу при наведении — «тяни, чтобы изменить размер»."""
+        value = self._grip_hover.value
+        if value <= 0.01:
+            return
+        grip = self._grip_rect()
+        painter.save()
+        pen = QPen(QColor(255, 255, 255, int(150 * value)), 1.2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        x1, y1 = grip.right() - 1.5, grip.bottom() - 1.5
+        for d in (3.0, 6.5, 10.0):
+            painter.drawLine(QPointF(x1, y1 - d), QPointF(x1 - d, y1))
+        painter.restore()
 
     def _draw_background(
         self, painter: QPainter, card: QRect, background: Optional[QPixmap], opacity: float
@@ -928,7 +1374,8 @@ class NowPlayingWidget(QWidget):
     def _draw_marquee(self, painter: QPainter, title: str) -> None:
         """Заголовок со сдвигом и растворением у краёв (маска через слой)."""
         rect = self._title_rect()
-        dpr = max(1.0, self.devicePixelRatioF())
+        # Слой рисуется сразу в масштабе окна — текст остаётся чётким.
+        dpr = max(1.0, self.devicePixelRatioF()) * self._effective_scale()
         layer = QPixmap(
             QSize(math.ceil(rect.width() * dpr), math.ceil(rect.height() * dpr))
         )
@@ -969,7 +1416,8 @@ class NowPlayingWidget(QWidget):
     # -- кнопки --------------------------------------------------------------
 
     def _draw_buttons(self, painter: QPainter) -> None:
-        alpha = self._buttons.value
+        # В мини-режиме кнопки — единственное содержимое и видны всегда.
+        alpha = 1.0 if self._mini else self._buttons.value
         if alpha <= 0.001:
             return
         painter.save()
@@ -1062,11 +1510,11 @@ class NowPlayingWidget(QWidget):
         self._marquee_frame.stop()
         self._marquee_pause.stop()
         self._marquee_offset = 0.0
-        if self.isVisible() and self._title_overflows():
+        if self.isVisible() and not self._mini and self._title_overflows():
             self._marquee_pause.start(MARQUEE_PAUSE_MS)
 
     def _marquee_resume(self) -> None:
-        if not (self.isVisible() and self._title_overflows()):
+        if not (self.isVisible() and not self._mini and self._title_overflows()):
             return
         self._marquee_clock.start()
         self._marquee_frame.start()
@@ -1075,7 +1523,7 @@ class NowPlayingWidget(QWidget):
         if not (self.isVisible() and self._title_overflows()):
             self._marquee_frame.stop()
             self._marquee_offset = 0.0
-            self.update(self._title_rect())
+            self.update(self._to_device(self._title_rect()))
             return
         # Сдвиг по реальному времени: скорость не зависит от частоты таймера
         # и «подлагиваний» цикла событий (кламп — без скачка после зависания).
@@ -1088,7 +1536,7 @@ class NowPlayingWidget(QWidget):
             self._marquee_frame.stop()
             self._marquee_pause.start(MARQUEE_PAUSE_MS)
         # Перерисовываем только полосу заголовка, а не всю карточку с тенью.
-        self.update(self._title_rect())
+        self.update(self._to_device(self._title_rect()))
 
     # ------------------------------------------------------------------
     # Мышь: hover, кнопки, перетаскивание
@@ -1103,7 +1551,95 @@ class NowPlayingWidget(QWidget):
         self._mouse_inside = False
         self._set_hover(None)
         self._buttons.to(0.0, BUTTONS_OUT_MS, ease_in_out_cubic)
+        if not self._volume_dragging:
+            self._set_volume_open(False)
+        if not self._resizing:
+            self._set_grip_hover(False)
         super().leaveEvent(event)
+
+    # -- громкость -----------------------------------------------------------
+
+    def _refresh_volume(self) -> None:
+        level = self._volume_backend.get()
+        if level is not None:
+            self._volume_level = level
+            self._volume_muted = self._volume_backend.muted
+
+    def _set_volume_open(self, wanted: bool) -> None:
+        if wanted == self._volume_wanted:
+            return
+        self._volume_wanted = wanted
+        if wanted:
+            self._refresh_volume()
+            self._volume_open.to(1.0, HOVER_IN_MS, ease_out_cubic)
+        else:
+            self._volume_open.to(0.0, HOVER_OUT_MS, ease_in_out_cubic)
+
+    def _volume_area(self) -> QRect:
+        """Значок + ползунок + зазор между ними — пока курсор тут, ползунок открыт."""
+        return self._volume_popup_rect().united(self._volume_icon_rect())
+
+    def _update_volume_hover(self, lpos: QPoint) -> None:
+        if self._mini or not self._volume_backend.available:
+            self._set_volume_open(False)
+            return
+        if self._volume_wanted:
+            inside = self._volume_area().adjusted(-4, -4, 4, 4).contains(lpos)
+        else:
+            inside = self._volume_icon_rect().contains(lpos)
+        self._set_volume_open(inside)
+
+    def _set_volume(self, level: float) -> None:
+        level = max(0.0, min(1.0, level))
+        self._volume_level = level
+        self._volume_backend.set(level)
+        if self._volume_muted and level > 0.0:
+            self._volume_muted = False
+            self._volume_backend.set_muted(False)
+        self.update()
+
+    def _volume_from_y(self, y: float) -> float:
+        track = self._volume_track_rect()
+        return (track.bottom() - y) / max(1.0, track.height())
+
+    def _toggle_mute(self) -> None:
+        self._refresh_volume()
+        self._volume_muted = not self._volume_muted
+        self._volume_backend.set_muted(self._volume_muted)
+        self._update_tooltip()
+        self.update()
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        lpos = self._to_logical(event.position())
+        if (
+            not self._mini
+            and self._volume_backend.available
+            and self._volume_area().adjusted(-4, -4, 4, 4).contains(lpos)
+        ):
+            self._refresh_volume()
+            step = VOLUME_STEP if event.angleDelta().y() > 0 else -VOLUME_STEP
+            self._set_volume(self._volume_level + step)
+            self._set_volume_open(True)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    # -- размер окна: тянем правый нижний угол -------------------------------
+
+    def _set_grip_hover(self, on: bool) -> None:
+        if on == self._grip_active:
+            return
+        self._grip_active = on
+        self._grip_hover.to(1.0 if on else 0.0, HOVER_IN_MS if on else HOVER_OUT_MS, ease_out_cubic)
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor if on else Qt.CursorShape.ArrowCursor)
+
+    def _resize_to_width(self, width: float) -> None:
+        """Ширина → масштаб; слишком узко — мини-режим (только три кнопки)."""
+        eq = width / WINDOW_SIZE.width()
+        if eq < MINI_SWITCH_SCALE:
+            self.set_display_mode(self._scale, True, notify=False, clamp=False)
+        else:
+            self.set_display_mode(eq, False, notify=False, clamp=False)
 
     def _set_hover(self, name: Optional[str]) -> None:
         if name == self._hover_button:
@@ -1121,6 +1657,15 @@ class NowPlayingWidget(QWidget):
             self._pressed_button = None
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._resizing:
+            dx = event.globalPosition().toPoint().x() - self._resize_start_global.x()
+            self._resize_to_width(self._resize_start_width + dx)
+            event.accept()
+            return
+        if self._volume_dragging:
+            self._set_volume(self._volume_from_y(self._to_logical(event.position()).y()))
+            event.accept()
+            return
         if self._dragging:
             delta = event.globalPosition().toPoint() - self._press_global
             if not self._drag_moved and manhattan(delta) > 3:
@@ -1132,17 +1677,36 @@ class NowPlayingWidget(QWidget):
             event.accept()
             return
 
-        pos = event.position().toPoint()
+        pos = self._to_logical(event.position())
         self._set_hover(self._button_at(pos) if self._mouse_inside else None)
+        self._update_volume_hover(pos)
+        self._set_grip_hover(self._mouse_inside and self._grip_rect().contains(pos))
         super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
+            pos = self._to_logical(event.position())
+            if self._grip_rect().contains(pos):
+                # Угол: тянем — меняется размер (а не двигается окно).
+                self._resizing = True
+                self._resize_start_global = event.globalPosition().toPoint()
+                self._resize_start_width = self.width()
+                event.accept()
+                return
+            if (
+                not self._mini
+                and self._volume_open.value > 0.5
+                and self._volume_popup_rect().adjusted(-3, -3, 3, 3).contains(pos)
+            ):
+                self._volume_dragging = True
+                self._set_volume(self._volume_from_y(pos.y()))
+                event.accept()
+                return
             self._dragging = True
             self._drag_moved = False
             self._press_global = event.globalPosition().toPoint()
             self._drag_offset = self.pos()
-            name = self._button_at(event.position().toPoint())
+            name = self._button_at(pos)
             if name is not None and self._button_enabled(name):
                 self._pressed_button = name
                 self._press[name].to(1.0, PRESS_MS, ease_out_cubic)
@@ -1151,19 +1715,38 @@ class NowPlayingWidget(QWidget):
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and self._resizing:
+            self._resizing = False
+            self._clamp_to_screen()
+            self.scale_changed.emit(self._scale, self._mini)
+            self.save_position()
+            self._set_grip_hover(self._grip_rect().contains(self._to_logical(event.position())))
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._volume_dragging:
+            self._volume_dragging = False
+            self._update_volume_hover(self._to_logical(event.position()))
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._dragging:
             self._dragging = False
             pressed = self._pressed_button
             self._release_press()
             if self._drag_moved:
                 self.save_position()
-            elif pressed is not None and self._button_at(event.position().toPoint()) == pressed:
+            elif pressed is not None and self._button_at(self._to_logical(event.position())) == pressed:
                 self._on_button_clicked(pressed)
             event.accept()
             return
         super().mouseReleaseEvent(event)
 
     def _on_button_clicked(self, name: str) -> None:
+        if name == "close":
+            self.quit_requested.emit()
+            return
+        if name == "volume":
+            self._toggle_mute()
+            return
         # Подключается из main.py к MediaController.
         handler = self._button_handlers.get(name)
         if handler is not None:
@@ -1184,12 +1767,25 @@ class NowPlayingWidget(QWidget):
         autostart_action.setCheckable(True)
         autostart_action.setChecked(self.settings.autostart_enabled)
 
+        size_menu = menu.addMenu("Размер")
+        size_actions = {}
+        for label, scale, mini in SIZE_PRESETS:
+            action = size_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(
+                mini == self._mini and (mini or abs(scale - self._scale) < 0.02)
+            )
+            size_actions[action] = (scale, mini)
+
         menu.addSeparator()
         settings_action = menu.addAction("Настройки")
         close_action = menu.addAction("Закрыть")
 
         chosen = menu.exec(event.globalPos())
-        if chosen is top_action:
+        if chosen in size_actions:
+            scale, mini = size_actions[chosen]
+            self.set_display_mode(scale, mini)
+        elif chosen is top_action:
             self.always_on_top_toggled.emit(top_action.isChecked())
         elif chosen is autostart_action:
             self.autostart_toggled.emit(autostart_action.isChecked())
@@ -1204,16 +1800,26 @@ class NowPlayingWidget(QWidget):
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802
         super().resizeEvent(event)
-        if self._cover is not None and not self._cover.isNull():
-            self._background = blur_pixmap(self._cover, self.size())
+        # Фон считается в логических размерах: при смене масштаба (тот же
+        # режим) пересчитывать его не нужно.
+        if (
+            self._cover is not None
+            and not self._cover.isNull()
+            and self._bg_size != self._logical_size()
+        ):
+            self._background = blur_pixmap(self._cover, self._logical_size())
+            self._bg_size = self._logical_size()
         self._restart_marquee()
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
         self._restart_marquee()
+        self._sync_ring_timer()
+        self._refresh_volume()
 
     def hideEvent(self, event) -> None:  # noqa: N802
         super().hideEvent(event)
+        self._ring_timer.stop()
         self._marquee_frame.stop()
         self._marquee_pause.stop()
         self._marquee_offset = 0.0

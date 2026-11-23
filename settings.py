@@ -32,6 +32,10 @@ def default_config_dir() -> Path:
     return root / APP_DIR_NAME
 
 
+#: Минимальный масштаб полного режима (дальше — мини-режим из трёх кнопок).
+MIN_SCALE = 0.6
+
+
 @dataclass
 class Settings:
     always_on_top: bool = True
@@ -39,6 +43,10 @@ class Settings:
     autostart_enabled: bool = False
     x: int | None = None
     y: int | None = None
+    #: Масштаб виджета: 1.0 — максимальный размер, меньше — уменьшенный.
+    scale: float = 1.0
+    #: Мини-режим: только кнопки prev / play / next.
+    mini: bool = False
 
     @classmethod
     def from_dict(cls, data: Any) -> "Settings":
@@ -50,8 +58,13 @@ class Settings:
         for key, value in data.items():
             if key not in known:
                 continue
-            if key in ("always_on_top", "hide_when_no_media", "autostart_enabled"):
+            if key in ("always_on_top", "hide_when_no_media", "autostart_enabled", "mini"):
                 values[key] = bool(value)
+            elif key == "scale":
+                try:
+                    values[key] = min(1.0, max(MIN_SCALE, float(value)))
+                except (TypeError, ValueError):
+                    pass
             elif key in ("x", "y"):
                 if value is None:
                     values[key] = None
@@ -69,6 +82,8 @@ class Settings:
             "autostart_enabled": self.autostart_enabled,
             "x": self.x,
             "y": self.y,
+            "scale": self.scale,
+            "mini": self.mini,
         }
 
 

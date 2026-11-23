@@ -103,6 +103,13 @@ class Application(QObject):
         self.widget.settings_requested.connect(self._open_settings)
         self.widget.quit_requested.connect(self.app.quit)
         self.widget.position_changed.connect(self._save_position)
+        self.widget.scale_changed.connect(self._save_scale)
+
+    def _save_scale(self, scale: float, mini: bool) -> None:
+        if (self.settings.scale, self.settings.mini) != (scale, mini):
+            self.settings.scale = scale
+            self.settings.mini = mini
+            self._persist()
 
     def _wire_controller(self) -> None:
         self.controller.track_changed.connect(self.widget.set_track)
@@ -110,6 +117,7 @@ class Application(QObject):
         self.controller.playback_state_changed.connect(self.widget.set_playing)
         self.controller.no_media.connect(self.widget.set_no_media)
         self.controller.modes_changed.connect(self.widget.set_modes)
+        self.controller.timeline_changed.connect(self.widget.set_timeline)
 
     # ------------------------------------------------------------------
     # Трей
