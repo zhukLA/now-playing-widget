@@ -328,3 +328,75 @@ def test_volume_icon_hidden_when_system_volume_unavailable(make_widget) -> None:
     w._mouse_inside = True
     w._update_volume_hover(w._volume_icon_rect().center())
     assert w._volume_open.value == 0.0
+
+
+# --- прилипание к краям экрана ---------------------------------------------
+
+
+def _area(qapp):
+    from PySide6.QtGui import QGuiApplication
+
+    return QGuiApplication.primaryScreen().availableGeometry()
+
+
+def test_snaps_card_to_left_and_top_edges(make_widget, qapp) -> None:
+    from ui.widget import SHADOW_MARGIN, SNAP_DISTANCE
+
+    w = make_widget()
+    area = _area(qapp)
+    near = QPoint(area.left() - SHADOW_MARGIN + SNAP_DISTANCE - 2, area.top() - SHADOW_MARGIN + 5)
+    snapped = w._snap_position(near)
+    # Край карточки (а не окна с тенью) ровно на краю экрана.
+    assert snapped.x() + SHADOW_MARGIN == area.left()
+    assert snapped.y() + SHADOW_MARGIN == area.top()
+
+
+def test_snaps_card_to_right_and_bottom_edges(make_widget, qapp) -> None:
+    from ui.widget import SHADOW_MARGIN
+
+    w = make_widget()
+    area = _area(qapp)
+    pos = QPoint(area.right() - w.width() + 8, area.bottom() - w.height() + 8)
+    snapped = w._snap_position(pos)
+    assert snapped.x() + w.width() - SHADOW_MARGIN == area.right() + 1
+    assert snapped.y() + w.height() - SHADOW_MARGIN == area.bottom() + 1
+
+
+def test_far_from_edges_position_is_unchanged(make_widget, qapp) -> None:
+    w = make_widget()
+    area = _area(qapp)
+    pos = QPoint(area.center().x() - w.width() // 2, area.center().y() - w.height() // 2)
+    assert w._snap_position(pos) == pos
+
+
+def test_dragging_past_threshold_breaks_away(make_widget, qapp) -> None:
+    """Продолжаем тянуть за край: сначала «липнет», потом окно идёт дальше."""
+    from ui.widget import SHADOW_MARGIN, SNAP_DISTANCE
+
+    w = make_widget()
+    area = _area(qapp)
+    y = area.center().y()
+    edge_x = area.left() - SHADOW_MARGIN
+    stuck = w._snap_position(QPoint(edge_x - SNAP_DISTANCE + 2, y))
+    assert stuck.x() == edge_x, "внутри порога — прилипло к краю"
+    free = QPoint(edge_x - SNAP_DISTANCE - 10, y)
+    assert w._snap_position(free) == free, "за порогом — свободное движение"
+
+
+def test_alt_disables_snapping(make_widget, qapp) -> None:
+    from ui.widget import SHADOW_MARGIN
+
+    w = make_widget()
+    area = _area(qapp)
+    w.move(area.center())
+    w._dragging = True
+    w._drag_moved = True
+    w._drag_offset = QPoint(area.left() - SHADOW_MARGIN + 6, area.center().y())
+    w._press_global = QPoint(0, 0)
+    event = QMouseEvent(
+        QMouseEvent.Type.MouseMove, QPointF(5, 5), QPointF(0, 0),
+        Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.AltModifier,
+    )
+    w.mouseMoveEvent(event)
+    assert w.pos() == QPoint(area.left() - SHADOW_MARGIN + 6, area.center().y())
+    w._dragging = False

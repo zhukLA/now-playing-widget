@@ -99,6 +99,9 @@ VOLUME_POPUP_W = 26
 VOLUME_POPUP_H = 62
 VOLUME_STEP = 0.05
 GRIP_SIZE = 14  # угол для изменения размера (правый нижний)
+#: Прилипание к краям экрана: на каком расстоянии (px) от края окно «липнет».
+#: Тянешь дальше этого расстояния — окно отрывается и едет за мышью.
+SNAP_DISTANCE = 18
 BUTTON_SIZE = 26
 BUTTON_GAP = 8
 #: Второстепенные кнопки (перемешивание, повтор) — меньше и без подложки.
@@ -720,6 +723,45 @@ class NowPlayingWidget(QWidget):
         self.update()
         if notify:
             self.scale_changed.emit(self._scale, self._mini)
+
+    def _snap_position(self, pos: QPoint) -> QPoint:
+        """Прилипание карточки к краям рабочей области экрана.
+
+        ``pos`` — желаемая позиция окна по движению мыши (не текущая), поэтому
+        «отрыв» получается сам собой: пока карточка в пределах SNAP_DISTANCE
+        от края, она стоит у края; дальше — снова следует за мышью.
+        Края, за которыми лежит соседний монитор, не липкие.
+        """
+        center = pos + QPoint(self.width() // 2, self.height() // 2)
+        screen = QGuiApplication.screenAt(center) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return pos
+        area = screen.availableGeometry()
+        margin = round(SHADOW_MARGIN * self._effective_scale())
+
+        def has_neighbour(point: QPoint) -> bool:
+            other = QGuiApplication.screenAt(point)
+            return other is not None and other is not screen
+
+        def snap(start: int, size: int, lo: int, hi: int, mid: int, horizontal: bool) -> int:
+            """Один из краёв (lo — левый/верхний, hi — правый/нижний, включительно)."""
+            card_lo = start + margin
+            card_hi = start + size - margin  # первый пиксель за карточкой
+            near_lo = card_lo - lo
+            near_hi = (hi + 1) - card_hi
+            best: Optional[tuple[int, int]] = None  # (расстояние, новое start)
+            probe_lo = QPoint(lo - 1, mid) if horizontal else QPoint(mid, lo - 1)
+            probe_hi = QPoint(hi + 1, mid) if horizontal else QPoint(mid, hi + 1)
+            if abs(near_lo) <= SNAP_DISTANCE and not has_neighbour(probe_lo):
+                best = (abs(near_lo), lo - margin)
+            if abs(near_hi) <= SNAP_DISTANCE and not has_neighbour(probe_hi):
+                if best is None or abs(near_hi) < best[0]:
+                    best = (abs(near_hi), hi + 1 - size + margin)
+            return start if best is None else best[1]
+
+        x = snap(pos.x(), self.width(), area.left(), area.right(), center.y(), True)
+        y = snap(pos.y(), self.height(), area.top(), area.bottom(), center.x(), False)
+        return QPoint(x, y)
 
     def _clamp_to_screen(self) -> None:
         """После смены размера не даём окну уехать за край экрана."""
@@ -1692,7 +1734,11 @@ class NowPlayingWidget(QWidget):
                 self._release_press()  # начали тащить — это не нажатие кнопки
                 self._set_hover(None)
             if self._drag_moved:
-                self.move(self._drag_offset + delta)
+                target = self._drag_offset + delta
+                # Alt при перетаскивании отключает прилипание.
+                if not (event.modifiers() & Qt.KeyboardModifier.AltModifier):
+                    target = self._snap_position(target)
+                self.move(target)
             event.accept()
             return
 
