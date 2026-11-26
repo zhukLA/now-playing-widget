@@ -105,6 +105,9 @@ class Application(QObject):
         self.widget.quit_requested.connect(self.app.quit)
         self.widget.position_changed.connect(self._save_position)
         self.widget.scale_changed.connect(self._save_scale)
+        self.widget.seek_requested.connect(self.controller.seek)
+        self.widget.session_selected.connect(self.controller.select_session)
+        self.widget.session_cycle_requested.connect(self.controller.cycle_session)
 
     def _save_scale(self, scale: float, mini: bool) -> None:
         if (self.settings.scale, self.settings.mini) != (scale, mini):
@@ -119,6 +122,7 @@ class Application(QObject):
         self.controller.no_media.connect(self.widget.set_no_media)
         self.controller.modes_changed.connect(self.widget.set_modes)
         self.controller.timeline_changed.connect(self.widget.set_timeline)
+        self.controller.sessions_changed.connect(self.widget.set_sessions)
 
     # ------------------------------------------------------------------
     # Трей

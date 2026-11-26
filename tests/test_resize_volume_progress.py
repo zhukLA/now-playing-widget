@@ -351,10 +351,7 @@ def test_gap_between_tracks_does_not_hide_widget(make_widget, pump) -> None:
 
 
 def test_real_no_media_still_hides_after_grace(make_widget, pump, monkeypatch) -> None:
-    import ui.widget as widget_module
-
-    monkeypatch.setattr(widget_module, "NO_MEDIA_GRACE_MS", 50)
-    w = make_widget(Settings(hide_when_no_media=True))
+    w = make_widget(Settings(hide_when_no_media=True, no_media_delay=0.05))
     w.set_no_media()
     assert pump(lambda: not w.isVisible(), timeout=1.0)
 
@@ -439,3 +436,62 @@ def test_alt_disables_snapping(make_widget, qapp) -> None:
     w.mouseMoveEvent(event)
     assert w.pos() == QPoint(area.left() - SHADOW_MARGIN + 6, area.center().y())
     w._dragging = False
+
+
+# --- оптимизация отрисовки -------------------------------------------------
+
+
+def _paint_calls(w, dirty):
+    """Какие части карточки рисуются при обновлении области ``dirty``."""
+    from PySide6.QtGui import QPainter, QPixmap
+
+    calls: list[str] = []
+    for name in ("_draw_ring", "_draw_cover", "_draw_texts", "_draw_buttons",
+                 "_draw_volume", "_draw_close", "_draw_grip"):
+        original = getattr(w, name)
+
+        def wrapper(*args, _n=name, _o=original):
+            calls.append(_n)
+            return _o(*args)
+
+        setattr(w, name, wrapper)
+    pixmap = QPixmap(w.size())
+    painter = QPainter(pixmap)
+    try:
+        w._paint(painter, dirty)
+    finally:
+        painter.end()
+    return calls
+
+
+def test_title_update_redraws_only_text(make_widget) -> None:
+    """Кадр бегущей строки не перерисовывает обложку, кольцо и кнопки."""
+    from PySide6.QtCore import QRectF
+
+    w = make_widget()
+    calls = _paint_calls(w, QRectF(w._title_rect()))
+    assert "_draw_texts" in calls
+    for skipped in ("_draw_ring", "_draw_cover", "_draw_buttons", "_draw_close", "_draw_grip"):
+        assert skipped not in calls
+
+
+def test_ring_update_redraws_ring_and_cover_only(make_widget) -> None:
+    w = make_widget()
+    calls = _paint_calls(w, w._ring_rect())
+    assert "_draw_ring" in calls and "_draw_cover" in calls
+    assert "_draw_texts" not in calls and "_draw_buttons" not in calls
+
+
+def test_full_update_redraws_everything(make_widget) -> None:
+    w = make_widget()
+    calls = _paint_calls(w, None)
+    for part in ("_draw_ring", "_draw_cover", "_draw_texts", "_draw_buttons",
+                 "_draw_volume", "_draw_close", "_draw_grip"):
+        assert part in calls
+
+
+def test_marquee_text_is_rendered_once_per_title(make_widget) -> None:
+    w = make_widget()
+    first = w._marquee_strip("Long title", 1.0)
+    assert w._marquee_strip("Long title", 1.0) is first, "кадры переиспользуют картинку"
+    assert w._marquee_strip("Other", 1.0) is not first

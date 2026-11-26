@@ -77,6 +77,13 @@ def test_to_dict_shape() -> None:
         "y",
         "scale",
         "mini",
+        "snap_to_edges",
+        "no_media_delay",
+        "hide_on_pause",
+        "hide_on_pause_delay",
+        "idle_translucent",
+        "idle_opacity",
+        "ring_from_cover",
     }
     json.dumps(d)  # должен быть сериализуем
 

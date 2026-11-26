@@ -35,6 +35,25 @@ def default_config_dir() -> Path:
 #: Минимальный масштаб полного режима (дальше — мини-режим из трёх кнопок).
 MIN_SCALE = 0.6
 
+#: Булевы поля настроек.
+_BOOL_FIELDS = (
+    "always_on_top",
+    "hide_when_no_media",
+    "autostart_enabled",
+    "mini",
+    "snap_to_edges",
+    "hide_on_pause",
+    "idle_translucent",
+    "ring_from_cover",
+)
+#: Числовые поля: (тип, минимум, максимум) — значения вне диапазона зажимаются.
+_NUMBER_FIELDS: dict[str, tuple[type, float, float]] = {
+    "scale": (float, MIN_SCALE, 1.0),
+    "no_media_delay": (float, 0.0, 10.0),
+    "hide_on_pause_delay": (int, 1, 600),
+    "idle_opacity": (int, 20, 100),
+}
+
 
 @dataclass
 class Settings:
@@ -47,24 +66,38 @@ class Settings:
     scale: float = 1.0
     #: Мини-режим: только кнопки prev / play / next.
     mini: bool = False
+    #: Прилипать к краям экрана при перетаскивании.
+    snap_to_edges: bool = True
+    #: Сколько ждать (с), прежде чем признать «медиа нет» — провал между треками.
+    no_media_delay: float = 2.5
+    #: Прятать виджет, если трек стоит на паузе дольше hide_on_pause_delay секунд.
+    hide_on_pause: bool = False
+    hide_on_pause_delay: int = 10
+    #: Полупрозрачность, когда мышь не над виджетом (idle_opacity — в процентах).
+    idle_translucent: bool = True
+    idle_opacity: int = 60
+    #: Цвет кольца прогресса берётся из обложки.
+    ring_from_cover: bool = True
 
     @classmethod
     def from_dict(cls, data: Any) -> "Settings":
         """Строит настройки из (возможно битого) словаря: неизвестные ключи игнорируются."""
         if not isinstance(data, dict):
             return cls()
-        known = {f.name: f.type for f in fields(cls)}
+        known = {f.name for f in fields(cls)}
         values: dict[str, Any] = {}
         for key, value in data.items():
             if key not in known:
                 continue
-            if key in ("always_on_top", "hide_when_no_media", "autostart_enabled", "mini"):
+            if key in _BOOL_FIELDS:
                 values[key] = bool(value)
-            elif key == "scale":
+            elif key in _NUMBER_FIELDS:
+                kind, low, high = _NUMBER_FIELDS[key]
                 try:
-                    values[key] = min(1.0, max(MIN_SCALE, float(value)))
-                except (TypeError, ValueError):
-                    pass
+                    number = kind(float(value))
+                except (TypeError, ValueError, OverflowError):
+                    continue  # битое значение — остаётся значение по умолчанию
+                values[key] = kind(min(high, max(low, number)))
             elif key in ("x", "y"):
                 if value is None:
                     values[key] = None
@@ -76,15 +109,7 @@ class Settings:
         return cls(**values)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "always_on_top": self.always_on_top,
-            "hide_when_no_media": self.hide_when_no_media,
-            "autostart_enabled": self.autostart_enabled,
-            "x": self.x,
-            "y": self.y,
-            "scale": self.scale,
-            "mini": self.mini,
-        }
+        return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
 class SettingsStore:

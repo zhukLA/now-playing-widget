@@ -216,6 +216,8 @@ class PlaybackModes:
     shuffle: Optional[bool] = None
     repeat_supported: bool = False
     shuffle_supported: bool = False
+    #: Можно ли перематывать (кликом по кольцу прогресса).
+    seek_supported: bool = False
 
 
 def _unbox(value: Any) -> Any:
@@ -277,15 +279,148 @@ def parse_playback_modes(playback_info: Any) -> PlaybackModes:
     if controls is not None:
         repeat_supported = bool(getattr(controls, "is_repeat_enabled", False))
         shuffle_supported = bool(getattr(controls, "is_shuffle_enabled", False))
+        seek_supported = bool(getattr(controls, "is_playback_position_enabled", False))
     else:
         repeat_supported = repeat is not None
         shuffle_supported = shuffle is not None
+        seek_supported = False
     return PlaybackModes(
         repeat=repeat,
         shuffle=shuffle,
         repeat_supported=repeat_supported,
         shuffle_supported=shuffle_supported,
+        seek_supported=seek_supported,
     )
+
+
+#: Методы перемотки (позиция в «тиках» TimeSpan по 100 нс).
+SEEK_METHOD = "try_change_playback_position_async"
+TICKS_PER_SECOND = 10_000_000
+
+
+async def seek_session(session: Any, position_s: float) -> bool:
+    """Просит плеер перемотать на абсолютную позицию (сек). True — согласился."""
+    method = getattr(session, SEEK_METHOD, None)
+    if method is None:
+        raise AttributeError(f"у сессии нет метода {SEEK_METHOD}")
+    ticks = max(0, int(round(position_s * TICKS_PER_SECOND)))
+    return bool(await _await_if_needed(method(ticks)))
+
+
+# ---------------------------------------------------------------------------
+# Несколько плееров: ключи и подписи сессий
+# ---------------------------------------------------------------------------
+
+#: Понятные названия для известных AUMID (без учёта регистра, по подстроке).
+_APP_NAMES = (
+    ("spotify", "Spotify"),
+    ("chrome", "Chrome"),
+    ("msedge", "Edge"),
+    ("firefox", "Firefox"),
+    ("opera", "Opera"),
+    ("yandex", "Яндекс Браузер"),
+    ("zunemusic", "Медиаплеер"),
+    ("zunevideo", "Кино и ТВ"),
+    ("vlc", "VLC"),
+    ("aimp", "AIMP"),
+    ("foobar", "foobar2000"),
+    ("telegram", "Telegram"),
+    ("music.ui", "Apple Music"),
+    ("applemusic", "Apple Music"),
+    ("yandexmusic", "Яндекс Музыка"),
+)
+
+
+def app_label(aumid: Optional[str]) -> str:
+    """AUMID сессии → короткое название приложения для меню."""
+    if not aumid:
+        return "Плеер"
+    low = aumid.lower()
+    # Порядок важен: «yandexmusic» раньше «yandex» (браузер).
+    for needle, label in sorted(_APP_NAMES, key=lambda item: -len(item[0])):
+        if needle in low:
+            return label
+    name = aumid.split("!")[-1]
+    name = name.rsplit("\\", 1)[-1]
+    if name.lower().endswith(".exe"):
+        name = name[:-4]
+    return name[:24] or "Плеер"
+
+
+@dataclass(frozen=True)
+class SessionInfo:
+    """Плеер для меню выбора: ключ, подпись, текущий ли он сейчас."""
+
+    key: str
+    label: str
+    title: str = ""
+    playing: bool = False
+    current: bool = False
+
+
+def session_keys(sessions: Iterable[Any]) -> list[tuple[str, Any]]:
+    """Ключи сессий: AUMID + номер среди сессий того же приложения.
+
+    WinRT на каждый вызов отдаёт новые Python-обёртки, сравнить сессии
+    напрямую нельзя — различаем по приложению и порядку в списке
+    (например, две вкладки Chrome: «Chrome#0» и «Chrome#1»).
+    """
+    seen: dict[str, int] = {}
+    keyed: list[tuple[str, Any]] = []
+    for session in sessions or ():
+        if session is None:
+            continue
+        aumid = _auid(session) or "?"
+        index = seen.get(aumid, 0)
+        seen[aumid] = index + 1
+        keyed.append((f"{aumid}#{index}", session))
+    return keyed
+
+
+def resolve_in_list(session: Any, keyed: list[tuple[str, Any]]) -> Any:
+    """Тот же плеер, но объект из списка (чтобы у него был ключ).
+
+    Если сессий этого приложения несколько — берём ту, у которой то же
+    состояние воспроизведения; иначе первую.
+    """
+    if session is None:
+        return None
+    aumid = _auid(session)
+    same_app = [s for k, s in keyed if _auid(s) == aumid]
+    if not same_app:
+        return session
+    if len(same_app) == 1:
+        return same_app[0]
+    status = session_playback_status(session)
+    for candidate in same_app:
+        if session_playback_status(candidate) == status:
+            return candidate
+    return same_app[0]
+
+
+def pick_session(
+    keyed: list[tuple[str, Any]], current: Any, pinned_key: Optional[str]
+) -> tuple[Any, Optional[str]]:
+    """Какую сессию показывать: (сессия, ключ закреплённого плеера или None).
+
+    Закреплённый пользователем плеер показывается, пока он существует;
+    пропал — закрепление снимается и выбор снова автоматический.
+    """
+    if pinned_key is not None:
+        for key, session in keyed:
+            if key == pinned_key:
+                return session, pinned_key
+        pinned_key = None
+    sessions = [s for _, s in keyed]
+    chosen = choose_session(resolve_in_list(current, keyed), sessions)
+    return chosen, None
+
+
+def key_of(session: Any, keyed: list[tuple[str, Any]]) -> Optional[str]:
+    for key, candidate in keyed:
+        if candidate is session:
+            return key
+    return None
 
 
 async def set_repeat_mode(session: Any, mode: str) -> bool:
@@ -506,7 +641,12 @@ class MockSession:
             shuffle=self._shuffle,
             repeat_supported=True,
             shuffle_supported=True,
+            seek_supported=True,
         )
+
+    def seek(self, position: float) -> None:
+        self._pos_base = max(0.0, min(self.duration, float(position)))
+        self._pos_since = time.monotonic() if self._playing else None
 
     def set_repeat(self, mode: str) -> None:
         if mode not in REPEAT_CYCLE:
@@ -634,6 +774,8 @@ class MediaController(QObject):
     modes_changed = Signal(object)
     #: (позиция, длительность) в секундах; длительность 0 — неизвестна
     timeline_changed = Signal(float, float)
+    #: (list[SessionInfo], закреплён ли плеер вручную) — для выбора плеера
+    sessions_changed = Signal(object, bool)
 
     def __init__(
         self,
@@ -670,6 +812,14 @@ class MediaController(QObject):
         self._cover_retry_task: Optional[asyncio.Task] = None
         # Периодический опрос позиции трека.
         self._timeline_task: Optional[asyncio.Task] = None
+        # Начало шкалы трека (StartTime): перемотка — в абсолютных значениях.
+        self._timeline_start = 0.0
+        # Несколько плееров: закреплённый пользователем и ключ текущего.
+        self._pinned_key: Optional[str] = None
+        self._session_key: Optional[str] = None
+        self._sessions_handler: Any = None
+        self._sessions_token: Any = None
+        self._publish_task: Optional[asyncio.Task] = None
 
         self._last_key: Optional[tuple[str, str]] = None
         self._last_cover: Optional[bytes] = None
@@ -756,6 +906,20 @@ class MediaController(QObject):
         logger.info("команда: shuffle")
         self._submit(self._command("shuffle"))
 
+    def seek(self, position: float) -> None:
+        """Перемотка на позицию (секунды от начала трека)."""
+        logger.info("команда: seek")
+        self._submit(self._seek(float(position)))
+
+    def select_session(self, key: Optional[str]) -> None:
+        """Закрепить плеер по ключу; None — снова выбирать автоматически."""
+        logger.info("команда: выбор плеера (%s)", "авто" if key is None else "вручную")
+        self._submit(self._select_session(key))
+
+    def cycle_session(self, step: int) -> None:
+        """Следующий/предыдущий плеер (колесо мыши по обложке)."""
+        self._submit(self._cycle_session(int(step)))
+
     # -- внутреннее: поток/цикл ---------------------------------------------
 
     def _submit(self, coro: Any) -> None:
@@ -804,6 +968,7 @@ class MediaController(QObject):
         try:
             props = session.get_timeline_properties()
             playing = bool(self._last_playing)
+            self._timeline_start = _seconds(getattr(props, "start_time", None))
         except Exception:
             logger.debug("get_timeline_properties не удался", exc_info=True)
             return
@@ -847,47 +1012,135 @@ class MediaController(QObject):
             logger.exception("подписка на current_session_changed не удалась")
             self.no_media.emit()
             return
+        try:
+            # Плеер открылся/закрылся — обновить список для выбора плеера.
+            self._sessions_handler = self._on_sessions_changed
+            self._sessions_token = manager.add_sessions_changed(self._sessions_handler)
+        except Exception:
+            logger.warning("подписка на sessions_changed не удалась", exc_info=True)
 
         # Сессия могла существовать ДО запуска — читаем её сразу, не дожидаясь событий.
+        self._apply_sessions(manager)
+
+    def _apply_sessions(self, manager: Any) -> None:
+        """Выбрать сессию для показа (с учётом закреплённого плеера)."""
+        if manager is None:
+            return
         try:
-            sessions = manager.get_sessions()
-            count = len(sessions)
+            sessions = list(manager.get_sessions())
         except Exception:
             logger.exception("get_sessions не удался")
-            sessions, count = [], 0
+            sessions = []
         try:
             current = manager.get_current_session()
         except Exception:
             logger.exception("get_current_session не удался")
             current = None
+        keyed = session_keys(sessions)
+        chosen, pinned = pick_session(keyed, current, self._pinned_key)
+        if self._pinned_key is not None and pinned is None:
+            logger.info("закреплённый плеер пропал — снова автоматический выбор")
+        self._pinned_key = pinned
+        self._session_key = key_of(chosen, keyed)
         logger.info(
-            "сессий при старте: %d, current=%s",
-            count,
+            "сессий: %d, current=%s, показываем=%s%s",
+            len(keyed),
             _auid(current),
+            _auid(chosen),
+            " (закреплён)" if pinned else "",
         )
-        chosen = choose_session(current, sessions)
-        if chosen is not None and chosen is not current:
-            logger.info("выбрана PLAYING-сессия вместо current: %s", _auid(chosen))
         self._set_session(chosen)
+        self._schedule_publish_sessions()
+
+    def _schedule_publish_sessions(self) -> None:
+        if self._publish_task is not None and not self._publish_task.done():
+            self._publish_task.cancel()
+        self._publish_task = asyncio.ensure_future(self._publish_sessions())
+
+    async def _publish_sessions(self) -> None:
+        """Список плееров для меню. Названия треков читаем, только если
+        плееров больше одного (иначе выбирать не из чего)."""
+        manager = self._manager
+        if manager is None:
+            return
+        try:
+            keyed = session_keys(list(manager.get_sessions()))
+        except Exception:
+            logger.debug("get_sessions для списка плееров", exc_info=True)
+            return
+        infos: list[SessionInfo] = []
+        for key, session in keyed:
+            title = ""
+            if len(keyed) > 1:
+                try:
+                    props = await asyncio.wait_for(get_media_properties(session), 1.0)
+                    title = parse_media_properties(props)[0]
+                except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                    title = ""
+            infos.append(
+                SessionInfo(
+                    key=key,
+                    label=app_label(_auid(session)),
+                    title=title,
+                    playing=is_playing_status(session_playback_status(session)),
+                    current=key == self._session_key,
+                )
+            )
+        self.sessions_changed.emit(infos, self._pinned_key is not None)
+
+    async def _select_session(self, key: Optional[str]) -> None:
+        self._pinned_key = key
+        self._apply_sessions(self._manager)
+
+    async def _cycle_session(self, step: int) -> None:
+        manager = self._manager
+        if manager is None:
+            return
+        try:
+            keyed = session_keys(list(manager.get_sessions()))
+        except Exception:
+            logger.debug("get_sessions для переключения плеера", exc_info=True)
+            return
+        if len(keyed) < 2:
+            return
+        keys = [k for k, _ in keyed]
+        index = keys.index(self._session_key) if self._session_key in keys else 0
+        self._pinned_key = keys[(index + step) % len(keys)]
+        logger.info("переключение плеера колесом → %d из %d", keys.index(self._pinned_key) + 1, len(keys))
+        self._apply_sessions(manager)
+
+    async def _seek(self, position: float) -> None:
+        if self._mock:
+            if self._mock_session is not None:
+                self._mock_session.seek(position)
+                self._emit_mock()
+            return
+        session = self._session
+        modes = self._last_modes or PlaybackModes()
+        if session is None or not modes.seek_supported:
+            logger.info("перемотка недоступна — команда пропущена")
+            return
+        try:
+            ok = await seek_session(session, self._timeline_start + position)
+            logger.info("перемотка: %s", "принято" if ok else "отклонено плеером")
+        except Exception:
+            logger.exception("перемотка не выполнена")
+            return
+        # Плеер применяет перемотку не мгновенно — перечитаем позицию чуть позже.
+        await asyncio.sleep(0.3)
+        if session is self._session:
+            self._emit_timeline()
 
     # -- колбэки WinRT (чужие потоки!) ---------------------------------------
 
     def _on_current_session_changed(self, sender: Any, args: Any) -> None:
         logger.info("событие: current_session_changed")
+        self._call_in_loop(lambda: self._apply_sessions(sender))
 
-        def apply() -> None:
-            try:
-                sessions = sender.get_sessions()
-                current = sender.get_current_session()
-            except Exception:
-                logger.exception("не удалось прочитать сессии в current_session_changed")
-                return
-            logger.info(
-                "сессий: %d, current=%s", len(sessions), _auid(current)
-            )
-            self._set_session(choose_session(current, sessions))
-
-        self._call_in_loop(apply)
+    def _on_sessions_changed(self, sender: Any, args: Any) -> None:
+        # Плеер появился или закрылся: выбор мог измениться, список — точно.
+        logger.info("событие: sessions_changed")
+        self._call_in_loop(lambda: self._apply_sessions(sender))
 
     def _on_media_properties_changed(self, sender: Any, args: Any) -> None:
         # Свойства изменились: трек мог смениться, обложка может быть ещё не готова.
@@ -1089,6 +1342,8 @@ class MediaController(QObject):
                 (_sha1(cover) or "")[:8] or None,
             )
             self.track_changed.emit(title, artist, cover)
+            # Название в меню «Плеер» тоже поменялось.
+            self._schedule_publish_sessions()
 
             same_as_prev = (
                 cover is not None
@@ -1424,6 +1679,7 @@ class MediaController(QObject):
                 self._debounce_task,
                 self._cover_retry_task,
                 self._timeline_task,
+                self._publish_task,
             )
             if t is not None
         ]
@@ -1435,6 +1691,7 @@ class MediaController(QObject):
         self._debounce_task = None
         self._cover_retry_task = None
         self._timeline_task = None
+        self._publish_task = None
         self._pending_cover = False
         self._pending_force = False
         if not self._mock:
@@ -1446,13 +1703,21 @@ class MediaController(QObject):
         """Однократная отписка от событий менеджера по сохранённому токену."""
         manager, self._manager = self._manager, None
         token, self._current_token = self._current_token, None
+        sessions_token, self._sessions_token = self._sessions_token, None
         self._current_handler = None
-        if manager is None or token is None:
+        self._sessions_handler = None
+        if manager is None:
             return
-        try:
-            manager.remove_current_session_changed(token)
-        except Exception:
-            logger.warning("remove_current_session_changed", exc_info=True)
+        if token is not None:
+            try:
+                manager.remove_current_session_changed(token)
+            except Exception:
+                logger.warning("remove_current_session_changed", exc_info=True)
+        if sessions_token is not None:
+            try:
+                manager.remove_sessions_changed(sessions_token)
+            except Exception:
+                logger.warning("remove_sessions_changed", exc_info=True)
         logger.debug("подписка на менеджер снята")
 
 
