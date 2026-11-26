@@ -137,24 +137,63 @@ def test_drag_corner_resizes_and_snaps_to_mini(make_widget) -> None:
 # --- крестик ---------------------------------------------------------------
 
 
-def test_close_button_requests_quit(make_widget) -> None:
-    w = make_widget()
-    quits = []
-    w.quit_requested.connect(lambda: quits.append(1))
+def _click_close(w) -> None:
     pos = w._close_rect().center()
     w.mousePressEvent(_event(QMouseEvent.Type.MouseButtonPress, w, pos))
     w.mouseReleaseEvent(_event(QMouseEvent.Type.MouseButtonRelease, w, pos))
-    assert quits == [1]
+
+
+def test_close_button_hides_without_quitting(make_widget) -> None:
+    w = make_widget()
+    quits = []
+    w.quit_requested.connect(lambda: quits.append(1))
+    _click_close(w)
+    assert quits == [], "крестик больше не завершает приложение"
+    assert w.dismissed and not w.isVisible()
 
 
 def test_close_button_works_in_mini_mode(make_widget) -> None:
     w = make_widget(Settings(mini=True))
-    quits = []
-    w.quit_requested.connect(lambda: quits.append(1))
-    pos = w._close_rect().center()
-    w.mousePressEvent(_event(QMouseEvent.Type.MouseButtonPress, w, pos))
-    w.mouseReleaseEvent(_event(QMouseEvent.Type.MouseButtonRelease, w, pos))
-    assert quits == [1]
+    _click_close(w)
+    assert w.dismissed and not w.isVisible()
+
+
+def test_dismissed_widget_returns_when_playback_starts(make_widget) -> None:
+    w = make_widget()
+    w.set_playing(False)
+    _click_close(w)
+    assert not w.isVisible()
+    w.set_playing(True)  # музыка снова заиграла
+    assert w.isVisible() and not w.dismissed
+
+
+def test_dismissed_widget_stays_hidden_on_track_change(make_widget) -> None:
+    """Следующий трек того же плейлиста — не повод снова выскакивать."""
+    w = make_widget()
+    w.set_playing(True)
+    _click_close(w)
+    w.set_track("Next", "Artist", None)
+    w.set_playing(True)  # состояние не изменилось — всё ещё играет
+    assert not w.isVisible() and w.dismissed
+
+
+def test_dismissed_widget_ignores_gap_between_tracks(make_widget, pump) -> None:
+    """Провал «нет медиа» между треками не должен будить скрытый виджет."""
+    w = make_widget()
+    w.set_playing(True)
+    _click_close(w)
+    w.set_no_media()
+    w.set_track("Next", "Artist", None)
+    w.set_playing(True)
+    pump(lambda: False, timeout=0.1)
+    assert not w.isVisible() and w.dismissed
+
+
+def test_tray_show_clears_dismiss(make_widget) -> None:
+    w = make_widget()
+    _click_close(w)
+    w.set_user_hidden(False)  # «Показать» из трея или повторный запуск
+    assert w.isVisible() and not w.dismissed
 
 
 def test_close_does_not_overlap_buttons_or_text(make_widget) -> None:

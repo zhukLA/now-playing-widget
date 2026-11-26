@@ -449,6 +449,8 @@ class NowPlayingWidget(QWidget):
         # Видимость: логическая цель (окно может ещё догорать на fade-out).
         self._target_visible = False
         self._user_hidden = False
+        # Скрыт крестиком до следующего начала воспроизведения.
+        self._dismissed = False
 
         # Состояние мыши/кнопок
         self._mouse_inside = False
@@ -594,7 +596,13 @@ class NowPlayingWidget(QWidget):
         # На паузе кольцо замирает там, где остановился трек.
         self._tl_position = self.progress_position()
         self._tl_clock.restart()
+        started = bool(is_playing) and not self._is_playing
         self._is_playing = bool(is_playing)
+        if started and self._dismissed:
+            # Скрыт крестиком — воспроизведение началось снова: показываемся.
+            # Смена трека без паузы сюда не попадает (состояние не менялось).
+            self._dismissed = False
+            self._apply_visibility()
         self._sync_ring_timer()
         self._play_morph.to(
             1.0 if self._is_playing else 0.0, PLAY_MORPH_MS, ease_in_out_cubic
@@ -781,7 +789,9 @@ class NowPlayingWidget(QWidget):
         пока играл трек, реакция откладывается на NO_MEDIA_GRACE_MS: придёт
         новый трек — виджет даже не мигнёт.
         """
-        if self._has_media and self.isVisible():
+        # Проверяем только наличие медиа, а не видимость: виджет, скрытый
+        # крестиком, иначе «просыпался» бы на каждом таком провале.
+        if self._has_media:
             if not self._no_media_timer.isActive():
                 self._no_media_timer.start(NO_MEDIA_GRACE_MS)
             return
@@ -810,7 +820,24 @@ class NowPlayingWidget(QWidget):
     def set_user_hidden(self, hidden: bool) -> None:
         """Скрытие/показ из трея (побеждает над настройкой «прятать без медиа»)."""
         self._user_hidden = bool(hidden)
+        if not hidden:
+            self._dismissed = False  # «Показать» из трея/ярлыка снимает и крестик
         self._apply_visibility()
+
+    def dismiss(self) -> None:
+        """Крестик: спрятать до следующего начала воспроизведения.
+
+        Приложение продолжает работать и следить за плеером: виджет
+        появится сам, когда музыка снова заиграет (после паузы или в новом
+        плеере). Полный выход — ПКМ → «Закрыть» или «Выход» в трее.
+        """
+        self._dismissed = True
+        self._set_hover(None)
+        self._apply_visibility()
+
+    @property
+    def dismissed(self) -> bool:
+        return self._dismissed
 
     @property
     def user_hidden(self) -> bool:
@@ -853,7 +880,7 @@ class NowPlayingWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _should_be_visible(self) -> bool:
-        if self._user_hidden:
+        if self._user_hidden or self._dismissed:
             return False
         return self._has_media or not self.settings.hide_when_no_media
 
@@ -1079,7 +1106,7 @@ class NowPlayingWidget(QWidget):
 
     def _button_tooltip(self, name: str) -> str:
         if name == "close":
-            return "Закрыть виджет"
+            return "Скрыть до следующего воспроизведения"
         if name == "volume":
             if not self._volume_backend.available:
                 return "Громкость недоступна"
@@ -1807,7 +1834,7 @@ class NowPlayingWidget(QWidget):
 
     def _on_button_clicked(self, name: str) -> None:
         if name == "close":
-            self.quit_requested.emit()
+            self.dismiss()
             return
         if name == "volume":
             self._toggle_mute()
