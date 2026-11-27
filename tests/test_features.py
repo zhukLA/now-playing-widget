@@ -387,3 +387,76 @@ def test_zero_no_media_delay_reacts_immediately(make_widget) -> None:
     w = make_widget(Settings(hide_when_no_media=True, no_media_delay=0.0))
     w.set_no_media()
     assert not w.isVisible()
+
+
+# --- клавиатура (виджет в фокусе) -------------------------------------------
+
+
+def _key(w, key, modifiers=Qt.KeyboardModifier.NoModifier, repeat=False) -> None:
+    from PySide6.QtGui import QKeyEvent
+
+    w.keyPressEvent(QKeyEvent(QKeyEvent.Type.KeyPress, key, modifiers, "", repeat))
+
+
+def _handlers(w) -> list:
+    seen: list[str] = []
+    w.set_button_handlers(
+        {n: (lambda n=n: seen.append(n)) for n in ("prev", "play_pause", "next")}
+    )
+    return seen
+
+
+def test_space_and_arrows_control_playback(make_widget) -> None:
+    w = make_widget()
+    seen = _handlers(w)
+    _key(w, Qt.Key.Key_Space)
+    _key(w, Qt.Key.Key_Left)
+    _key(w, Qt.Key.Key_Right)
+    assert seen == ["play_pause", "prev", "next"]
+
+
+def test_held_key_does_not_repeat_commands(make_widget) -> None:
+    w = make_widget()
+    seen = _handlers(w)
+    _key(w, Qt.Key.Key_Right, repeat=True)
+    assert seen == []
+
+
+def test_modifier_combinations_are_ignored(make_widget) -> None:
+    w = make_widget()
+    seen = _handlers(w)
+    _key(w, Qt.Key.Key_Space, Qt.KeyboardModifier.ControlModifier)
+    _key(w, Qt.Key.Key_Right, Qt.KeyboardModifier.AltModifier)
+    assert seen == []
+
+
+def test_keys_do_nothing_without_media(make_widget) -> None:
+    w = make_widget()
+    seen = _handlers(w)
+    w._apply_no_media()
+    _key(w, Qt.Key.Key_Space)
+    assert seen == []
+
+
+def test_up_down_change_volume_and_slider_peeks(make_widget) -> None:
+    w = make_widget()
+    levels: list[float] = []
+    w._volume_backend.set = lambda v: levels.append(v) or True
+    _key(w, Qt.Key.Key_Up)
+    assert levels[-1] == pytest.approx(0.55)
+    _key(w, Qt.Key.Key_Down, repeat=True)  # удержание для громкости разрешено
+    assert levels[-1] == pytest.approx(0.45)
+    assert w._volume_open.value == 1.0
+    w._end_key_peek()
+    assert w._volume_open.value == 0.0
+
+
+def test_escape_hides_until_playback(make_widget) -> None:
+    w = make_widget()
+    _key(w, Qt.Key.Key_Escape)
+    assert w.dismissed and not w.isVisible()
+
+
+def test_widget_accepts_keyboard_focus(make_widget) -> None:
+    w = make_widget()
+    assert w.focusPolicy() == Qt.FocusPolicy.StrongFocus

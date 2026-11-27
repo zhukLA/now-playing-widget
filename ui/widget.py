@@ -46,6 +46,7 @@ from PySide6.QtGui import (
     QFont,
     QFontMetrics,
     QGuiApplication,
+    QKeyEvent,
     QLinearGradient,
     QMouseEvent,
     QPaintEvent,
@@ -157,6 +158,15 @@ EXTRA_NAMES = ("close", "volume")
 ALL_NAMES = BUTTON_NAMES + EXTRA_NAMES
 
 REPEAT_LABELS = {"off": "выкл", "all": "все треки", "one": "один трек"}
+
+#: Клавиши → кнопки виджета (когда он в фокусе).
+KEY_BUTTONS = {
+    Qt.Key.Key_Space: "play_pause",
+    Qt.Key.Key_Left: "prev",
+    Qt.Key.Key_Right: "next",
+}
+#: Сколько показывать кнопки/громкость после нажатия клавиши, мс.
+KEY_PEEK_MS = 1400
 
 #: Размеры из контекстного меню: (название, масштаб, мини-режим).
 SIZE_PRESETS = (
@@ -529,6 +539,8 @@ class NowPlayingWidget(QWidget):
         self.setWindowFlag(Qt.WindowType.Tool, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
+        # Клавиши (пробел, стрелки, Esc) работают, пока виджет в фокусе.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._apply_size()
 
         # Данные трека
@@ -602,6 +614,10 @@ class NowPlayingWidget(QWidget):
         self._no_media_timer = QTimer(self)
         self._no_media_timer.setSingleShot(True)
         self._no_media_timer.timeout.connect(self._apply_no_media)
+        # После нажатия клавиши кнопки/громкость ненадолго показываются.
+        self._key_peek = QTimer(self)
+        self._key_peek.setSingleShot(True)
+        self._key_peek.timeout.connect(self._end_key_peek)
         # Кольцо прогресса двигается по таймеру, пока трек играет.
         self._ring_timer = QTimer(self)
         self._ring_timer.setInterval(RING_TICK_MS)
@@ -2177,6 +2193,9 @@ class NowPlayingWidget(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
+            # Клик по виджету даёт ему фокус клавиатуры.
+            self.activateWindow()
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
             pos = self._to_logical(event.position())
             if self._grip_rect().contains(pos):
                 # Угол: тянем — меняется размер (а не двигается окно).
@@ -2251,6 +2270,63 @@ class NowPlayingWidget(QWidget):
         handler = self._button_handlers.get(name)
         if handler is not None:
             handler()
+
+    # ------------------------------------------------------------------
+    # Клавиатура (только когда виджет в фокусе)
+    # ------------------------------------------------------------------
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        """Пробел — плей/пауза, ← → — треки, ↑ ↓ — громкость, Esc — спрятать."""
+        blocking = (
+            Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.AltModifier
+            | Qt.KeyboardModifier.MetaModifier
+        )
+        if event.modifiers() & blocking:
+            super().keyPressEvent(event)  # Alt+F4 и прочие сочетания не трогаем
+            return
+        key = event.key()
+        if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+            # Автоповтор разрешён: удержание плавно меняет громкость.
+            self._key_volume(VOLUME_STEP if key == Qt.Key.Key_Up else -VOLUME_STEP)
+        elif key == Qt.Key.Key_Escape:
+            self.dismiss()
+        elif key in KEY_BUTTONS:
+            # Удержание не должно «пролистывать» треки и мигать паузой.
+            if not event.isAutoRepeat():
+                self._key_button(KEY_BUTTONS[key])
+        else:
+            super().keyPressEvent(event)
+            return
+        event.accept()
+
+    def _key_button(self, name: str) -> None:
+        if not self._button_enabled(name):
+            return
+        # Та же «пружина», что при клике мышью, — видно, что клавиша сработала.
+        self._press[name].set(1.0)
+        self._press[name].to(0.0, RELEASE_MS, spring)
+        self._start_key_peek()
+        self._on_button_clicked(name)
+
+    def _key_volume(self, step: float) -> None:
+        if not self._volume_backend.available:
+            return
+        self._refresh_volume()
+        self._set_volume(self._volume_level + step)
+        if not self._mini:
+            self._set_volume_open(True)
+            self._start_key_peek()
+
+    def _start_key_peek(self) -> None:
+        self._buttons.to(1.0, BUTTONS_IN_MS, ease_out_cubic)
+        self._key_peek.start(KEY_PEEK_MS)
+
+    def _end_key_peek(self) -> None:
+        if self._mouse_inside:
+            return  # мышь над виджетом — всё решает наведение
+        self._set_volume_open(False)
+        self._buttons.to(0.0, BUTTONS_OUT_MS, ease_in_out_cubic)
 
     # ------------------------------------------------------------------
     # Контекстное меню
